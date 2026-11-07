@@ -1,0 +1,160 @@
+import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+
+export type Language = 'vi' | 'en'
+
+// English is the source language. Keys deliberately match the user-facing strings
+// in App.tsx and the known, fixed API error messages; unknown CTU responses remain
+// unmodified rather than being guessed at or misrepresented.
+//
+const vi: Record<string, string> = {
+  'Library reservation portal': 'Cổng đặt phòng thư viện',
+  'Official CTU site': 'Trang CTU chính thức',
+  'Logout': 'Đăng xuất', 'Log out': 'Đăng xuất', 'Sign in': 'Đăng nhập',
+  'Register': 'Đăng ký', 'Create an account': 'Tạo tài khoản',
+  'Welcome back': 'Chào mừng trở lại',
+  'Save your own CTU credentials securely for reservations.': 'Lưu an toàn thông tin đăng nhập CTU của bạn để đặt phòng.',
+  'Sign in to request a library room.': 'Đăng nhập để đăng ký phòng thư viện.',
+  'App username': 'Tên đăng nhập ứng dụng', 'App password': 'Mật khẩu ứng dụng',
+  'Your CTU credentials are stored separately (encrypted), and are only sent to CTU when you make a booking.': 'Thông tin đăng nhập CTU được lưu riêng dưới dạng mã hóa và chỉ được gửi đến CTU khi bạn đặt phòng.',
+  'CTU username / student ID': 'Tên đăng nhập / MSSV CTU',
+  'CTU password': 'Mật khẩu CTU', 'CTU account password': 'Mật khẩu tài khoản CTU',
+  'Please wait…': 'Vui lòng chờ…', 'Create account': 'Tạo tài khoản',
+  'Close': 'Đóng', 'Processing…': 'Đang xử lý…', 'Saving…': 'Đang lưu…',
+  'Confirm request': 'Xác nhận yêu cầu', 'Schedule an attempt': 'Lên lịch đăng ký',
+  'Reserve this room': 'Đăng ký phòng', 'Shift': 'Ca',
+  'Book now': 'Đặt ngay', 'Schedule later': 'Đặt lịch sau',
+  'When should the app attempt this booking? (your local time)': 'Thời điểm hệ thống thử đăng ký (giờ thiết bị của bạn)',
+  'Group size (5–20 students)': 'Số sinh viên (5–20)',
+  'Group size (5–20)': 'Số sinh viên (5–20)',
+  'Purpose / note (optional)': 'Mục đích / ghi chú (không bắt buộc)',
+  'Group study or discussion': 'Học nhóm hoặc thảo luận',
+  'Request a TV': 'Yêu cầu mượn TV',
+  'This schedules one attempt, not a reservation. An empty slot may not yet be open for booking; CTU decides whether it accepts the request.': 'Đây chỉ là lịch thử đăng ký, chưa phải đặt phòng thành công. Ca còn trống có thể chưa mở đăng ký; CTU là bên quyết định.',
+  'CTU makes the final decision. Empty does not necessarily mean bookable; the app rechecks after logging into CTU. Only an explicit CTU confirmation counts as success.': 'CTU là bên quyết định cuối cùng. Ca trống chưa chắc được đăng ký; ứng dụng kiểm tra lại sau khi đăng nhập. Chỉ thông báo xác nhận rõ ràng của CTU mới tính là thành công.',
+  'Create scheduled attempt': 'Tạo lịch thử đăng ký',
+  'Submit reservation': 'Gửi yêu cầu đặt phòng',
+  'Pre-book 13 days ahead': 'Đặt lịch trước 13 ngày',
+  'Choose the date you want the room (Day A). The server schedules the attempt for Day A minus 13 days, using Vietnam time (UTC+07).': 'Chọn ngày bạn muốn sử dụng phòng (ngày A). Máy chủ sẽ lên lịch thử đăng ký vào ngày A trừ 13 ngày, theo giờ Việt Nam (UTC+07).',
+  'Day A — target reservation date': 'Ngày A — ngày muốn sử dụng phòng',
+  'Official CTU booking-opening hour (HH:MM, Vietnam)': 'Giờ CTU mở đăng ký (HH:MM, giờ Việt Nam)',
+  'The attached timetable does not specify this hour. Verify it with the library; the app does not assume midnight.': 'Lịch đính kèm không ghi giờ mở đăng ký. Hãy xác nhận với thư viện; ứng dụng không mặc định là 00:00.',
+  'Automatic attempt (Vietnam time)': 'Thời điểm tự động thử đăng ký (giờ Việt Nam)',
+  '13 calendar days before': 'Trước 13 ngày so với', 'the target date': 'ngày đã chọn',
+  'The job is saved in SQLite and survives restarts. At opening time, the server checks CTU and attempts booking only for an empty or bookable slot. It briefly rechecks unopened slots; it never repeats an uncertain CTU submission. This does not guarantee a reservation.': 'Công việc được lưu trong SQLite và vẫn tồn tại sau khi khởi động lại. Đến giờ mở đăng ký, hệ thống kiểm tra CTU và chỉ thử đăng ký ca trống. Hệ thống kiểm tra lại ca chưa mở trong một khoảng ngắn nhưng không gửi lại yêu cầu CTU chưa xác định kết quả. Không đảm bảo đặt phòng thành công.',
+  'Schedule pre-booking': 'Lưu lịch đặt trước',
+  'Powered by CTU live calendar': 'Dữ liệu từ lịch CTU trực tuyến',
+  'Find your space to': 'Tìm không gian để', 'focus.': 'tập trung.',
+  'Explore discussion rooms, see their availability, and request a study session with your CTU account.': 'Khám phá các phòng thảo luận, xem lịch còn trống và đăng ký bằng tài khoản CTU.',
+  'Last synced': 'Đồng bộ lần cuối', 'Refresh': 'Làm mới',
+  'Availability': 'Lịch phòng', 'My bookings': 'Phòng đã đặt',
+  'Scheduled attempts': 'Lịch đăng ký', 'Telegram & account': 'Telegram & tài khoản',
+  'Schedule data is stale or from an offline snapshot. You can inspect it, but every reservation still requires a fresh CTU check. Empty but non-clickable CTU cells are shown separately as tentative vacancies; CTU confirms eligibility when booking.': 'Dữ liệu lịch đã cũ hoặc từ bản lưu ngoại tuyến. Bạn vẫn có thể xem, nhưng mỗi lần đặt phòng đều phải kiểm tra dữ liệu CTU mới. Ô trống nhưng không thể nhấp ở CTU được hiển thị riêng; CTU xác nhận tính hợp lệ khi đăng ký.',
+  'Loading schedule…': 'Đang tải lịch phòng…',
+  'Rooms monitored': 'Số phòng theo dõi',
+  'Empty shifts in selected room': 'Ca trống của phòng đang chọn',
+  'Reserved shifts in selected room': 'Ca đã được đặt',
+  'Choose a room': 'Chọn phòng', 'Discussion Rooms A–C': 'Phòng thảo luận A–C',
+  'Other library rooms': 'Các phòng thư viện khác', 'Floor': 'Tầng',
+  'Room availability': 'Lịch sử dụng phòng',
+  'Choose an empty or bookable shift; CTU confirms eligibility at submission.': 'Chọn ca còn trống hoặc có thể đăng ký; CTU sẽ xác nhận khi gửi yêu cầu.',
+  'Date': 'Ngày', 'Bookable': 'Có thể đặt', 'Empty (check CTU)': 'Còn trống (chờ CTU xác nhận)',
+  'Reserved': 'Đã đặt', 'Not open': 'Chưa mở', 'Closed': 'Đóng cửa',
+  'Plan attempt': 'Lên lịch thử', 'Empty · verify': 'Trống · cần kiểm tra',
+  'No calendar loaded yet. Verify CTU connectivity and refresh.': 'Chưa tải được lịch. Hãy kiểm tra kết nối CTU và làm mới.',
+  'My reservations': 'Lịch sử đặt phòng',
+  'History of CTU submissions under your account': 'Các yêu cầu đăng ký CTU từ tài khoản của bạn',
+  'No reservations yet.': 'Chưa có lịch đặt phòng nào.',
+  'students': 'sinh viên', 'Attempts': 'Lượt thử',
+  'Restarts recovered': 'Lần khôi phục',
+  'Opens': 'Giờ mở', 'Attempt': 'Thời điểm thử',
+  'Awaiting scheduled time': 'Đang chờ tới giờ',
+  '13-day pre-book': 'Đặt trước 13 ngày', 'Cancel': 'Hủy',
+  'Pre-booking starts 13 days before your target date. A scheduled job is not a reservation. SQLite keeps pending tasks after a crash. The event-driven scheduler wakes at the next deadline and on new jobs, with a 30-second recovery check. Possible CTU submissions are never repeated automatically.': 'Tác vụ đặt trước chạy 13 ngày trước ngày sử dụng. Lịch thử đăng ký chưa phải đặt phòng thành công. SQLite lưu các tác vụ khi ứng dụng gặp lỗi; bộ lập lịch thức dậy đúng hạn, khi có tác vụ mới và kiểm tra phục hồi mỗi 30 giây. Các yêu cầu CTU chưa rõ kết quả không được tự gửi lại.',
+  'No scheduled attempts yet. Use Pre-book 13 days ahead or choose a shift in Availability.': 'Chưa có lịch đăng ký. Hãy chọn đặt trước 13 ngày hoặc chọn một ca trong Lịch phòng.',
+  'Account details': 'Thông tin tài khoản', 'Linked CTU account': 'Tài khoản CTU đã liên kết',
+  'CTU passwords are encrypted at rest and never sent to the browser after registration.': 'Mật khẩu CTU được mã hóa khi lưu trữ và không được gửi về trình duyệt sau khi đăng ký.',
+  'Telegram notifications': 'Thông báo Telegram',
+  'Connect your Telegram chat once to receive confirmed, failed, or uncertain booking outcomes. Telegram requires starting the bot first; a phone number or @username alone cannot start a private chat.': 'Liên kết Telegram để nhận thông báo đặt phòng thành công, thất bại hoặc chưa xác định. Bạn phải mở bot trước; chỉ có số điện thoại hay @username không thể bắt đầu trò chuyện riêng.',
+  'Telegram linked': 'Đã liên kết Telegram', 'Telegram is not linked yet.': 'Chưa liên kết Telegram.',
+  'Disconnect Telegram': 'Ngắt liên kết Telegram',
+  'Generating…': 'Đang tạo…', 'Get one-time bot link': 'Tạo liên kết bot một lần',
+  'Check connection': 'Kiểm tra kết nối', 'Open Telegram bot': 'Mở bot Telegram',
+  'Expires in 10 minutes. Do not share this link.': 'Liên kết hết hạn sau 10 phút. Không chia sẻ liên kết này.',
+  'Unofficial student-operated interface': 'Ứng dụng do sinh viên phát triển, không thuộc CTU',
+  'CTU remains the source of truth': 'CTU là nguồn xác nhận chính thức',
+  'Official reservation site': 'Trang đăng ký chính thức',
+  'Reservation confirmed': 'Đặt phòng thành công',
+  'Confirmation could not be verified': 'Chưa xác minh được kết quả đặt phòng',
+  'Reservation not confirmed': 'Chưa xác nhận đặt phòng',
+  'View my reservations': 'Xem các phòng đã đăng ký',
+  'confirmed': 'Thành công', 'failed': 'Thất bại', 'pending': 'Đang xử lý',
+  'uncertain': 'Chưa xác định', 'processing': 'Đang chạy',
+  'scheduled': 'Đã lên lịch', 'cancelled': 'Đã hủy',
+  'Please sign in': 'Vui lòng đăng nhập',
+  'Invalid server response': 'Phản hồi máy chủ không hợp lệ',
+  'Could not sign in': 'Không thể đăng nhập',
+  'Could not reserve the room': 'Không thể đăng ký phòng',
+  'Choose a valid date and time for the attempt': 'Hãy chọn ngày giờ thử đăng ký hợp lệ',
+  'Choose the actual CTU booking-opening hour in Vietnam time': 'Hãy chọn giờ mở đăng ký CTU chính xác theo giờ Việt Nam',
+  'Unable to schedule pre-booking': 'Không thể lên lịch đặt trước',
+  'Could not load schedule': 'Không tải được lịch phòng',
+  'Could not load': 'Không tải được dữ liệu', 'Logout failed': 'Đăng xuất thất bại',
+  'Telegram link unavailable': 'Không tạo được liên kết Telegram',
+  'Could not cancel scheduled attempt': 'Không thể hủy lịch đăng ký',
+  'Could not unlink': 'Không thể ngắt liên kết',
+  'CTU confirmed the reservation': 'CTU đã xác nhận đặt phòng thành công',
+  'CTU reports this shift as reserved, closed, expired, or unknown': 'Theo CTU, ca này đã được đặt, đóng, quá hạn hoặc không xác định',
+  'CTU reports this shift as reserved, closed or expired': 'Theo CTU, ca này đã được đặt, đóng hoặc quá hạn',
+  'CTU reports this shift as already reserved': 'Theo CTU, ca này đã được đặt',
+  'CTU reports this shift as closed or expired': 'Theo CTU, ca này đã đóng hoặc quá hạn',
+  'The shift is missing from the logged-in CTU timetable': 'Không tìm thấy ca này trong lịch CTU sau khi đăng nhập',
+  'CTU login was rejected; check your CTU credentials': 'CTU từ chối đăng nhập; hãy kiểm tra tài khoản CTU',
+  'CTU login request failed': 'Gửi yêu cầu đăng nhập CTU thất bại',
+  'Could not initialize a CTU login session': 'Không thể khởi tạo phiên đăng nhập CTU',
+  'Cannot validate the logged-in CTU timetable': 'Không thể xác thực lịch CTU sau khi đăng nhập',
+  'Cannot load the logged-in CTU timetable': 'Không thể tải lịch CTU sau khi đăng nhập',
+  'CTU did not return its exact confirmation; verify on the official website before retrying': 'CTU không phản hồi xác nhận chính xác; kiểm tra trang CTU trước khi thử lại',
+  'CTU returned an error after submission; verify before retrying': 'CTU trả lỗi sau khi gửi yêu cầu; hãy kiểm tra trước khi thử lại',
+  'The CTU response was lost after submission; verify before retrying': 'Mất phản hồi sau khi gửi CTU; hãy kiểm tra trước khi thử lại',
+  'Waiting for CTU to open this slot (no booking POST sent)': 'Đang chờ CTU mở ca (chưa gửi yêu cầu đặt phòng)',
+  'Schedule unavailable; no POST sent': 'Lịch CTU không truy cập được; chưa gửi yêu cầu đặt phòng',
+  'CTU temporarily unavailable; no POST sent': 'CTU tạm thời không truy cập được; chưa gửi yêu cầu đặt phòng',
+  'CTU did not open this shift during the checking window': 'CTU không mở ca này trong thời gian kiểm tra',
+  'CTU schedule was unavailable during the checking window': 'Lịch CTU không khả dụng trong thời gian kiểm tra',
+  'Recovered after restart; no CTU submission had started': 'Đã khôi phục sau khi khởi động lại; chưa gửi yêu cầu CTU',
+  'Cancelled by user': 'Người dùng đã hủy',
+  'Slot is not present in the current CTU calendar': 'Ca này không có trong lịch CTU hiện tại',
+  'This room/shift is already booked or awaiting confirmation': 'Phòng/ca này đã được đặt hoặc đang chờ xác nhận',
+  'Another reservation already holds this room/time': 'Có đăng ký khác đang giữ phòng/ca này',
+  'You already have an active or unverified reservation for this time/date': 'Bạn đã có một đăng ký còn hiệu lực hoặc chưa xác minh cho thời điểm này',
+  'CTU bookings open at most 13 days before the target date; create a pre-booking instead': 'CTU chỉ cho đặt trước tối đa 13 ngày; hãy dùng đặt lịch trước',
+  'Invalid room/shift combination': 'Phòng và ca không hợp lệ',
+  'Group size must be 5–20': 'Số lượng phải từ 5 đến 20 sinh viên',
+  'Note is too long': 'Ghi chú quá dài',
+  'This shift has already ended': 'Ca này đã kết thúc',
+  'Internal server error': 'Lỗi máy chủ nội bộ',
+}
+
+export const translate = (language: Language, text: string): string =>
+  language === 'vi' ? (vi[text] ?? text) : text
+
+const LanguageContext = createContext<{
+  language: Language
+  setLanguage: (language: Language) => void
+  t: (text: string) => string
+}>({ language: 'vi', setLanguage: () => {}, t: text => text })
+
+export function LanguageProvider({ children }: { children: ReactNode }) {
+  const [language, setLanguage] = useState<Language>(() => {
+    try { return window.localStorage.getItem('itclub-autoroom-language') === 'en' ? 'en' : 'vi' }
+    catch { return 'vi' }
+  })
+  useEffect(() => {
+    document.documentElement.lang = language
+    try { window.localStorage.setItem('itclub-autoroom-language', language) } catch { /* private mode */ }
+  }, [language])
+  const value = useMemo(() => ({ language, setLanguage, t: (text: string) => translate(language, text) }), [language])
+  return <LanguageContext.Provider value={value}>{children}</LanguageContext.Provider>
+}
+
+export function useI18n() { return useContext(LanguageContext) }
