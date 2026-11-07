@@ -47,11 +47,15 @@ pub fn parse(html: &str) -> Result<Schedule, String> {
             if cells.len() != count { return Err(format!("Unexpected slot count for room {id}: {}",cells.len())); }
             for (i, cell) in cells.into_iter().enumerate() {
                 let classes = cell.value().classes().collect::<Vec<_>>();
-                // Only actual CTU clickable empty cells may be booked. 'catrong_khl'
-                // means empty but NOT currently bookable. All unknown styles fail closed.
+                // CTU uses 'catrong_khl' for EMPTY cells that are not clickable
+                // in this view (for example, before a user logs in). That does
+                // not mean a reservation exists. Keep occupancy separate from
+                // confirmed eligibility. Never promote unknown/expired cells.
                 let status = if classes.contains(&"caban") { "reserved" }
                     else if classes.contains(&"chunhat") { "closed" }
+                    else if classes.contains(&"catrong_quahan") { "unavailable" }
                     else if classes.contains(&"catrong_hl") { "available" }
+                    else if classes.contains(&"catrong_khl") { "vacant" }
                     else { "unavailable" };
                 let slot_id = start + i as i64;
                 // If CTU exposes explicit POST attributes, do not accept conflicting mappings.
@@ -75,12 +79,25 @@ pub fn parse(html: &str) -> Result<Schedule, String> {
 }
 
 pub async fn fetch_live(state: &AppState) -> Result<Schedule, ApiError> {
+    let started = std::time::Instant::now();
     let url = format!("{}/lich.php", state.cfg.ctu_base.trim_end_matches('/'));
     let response = state.http.get(&url).header("Accept", "text/html").send().await
         .map_err(|e| { tracing::warn!(error=%e,"CTU schedule unavailable"); ApiError::unavailable("Cannot reach CTU schedule; booking is disabled") })?;
-    if !response.status().is_success() { return Err(ApiError::unavailable("CTU schedule returned an error")); }
+    if !response.status().is_success() {
+        tracing::warn!(stage="public_timetable", http_status=response.status().as_u16(),
+            elapsed_ms=started.elapsed().as_millis() as u64,
+            "CTU public timetable HTTP request rejected");
+        return Err(ApiError::unavailable("CTU schedule returned an error"));
+    }
     let body = response.text().await.map_err(|_| ApiError::unavailable("Cannot decode CTU schedule"))?;
-    parse(&body).map_err(|e| { tracing::warn!(error=%e,"CTU schedule format changed"); ApiError::unavailable("CTU schedule format is not recognized; booking is disabled") })
+    let calendar = parse(&body).map_err(|e| {
+        tracing::warn!(stage="public_timetable", parse_error=%e,"CTU schedule format changed");
+        ApiError::unavailable("CTU schedule format is not recognized; booking is disabled")
+    })?;
+    tracing::debug!(stage="public_timetable", room_count=calendar.rooms.len(),
+        slot_count=calendar.slots.len(), elapsed_ms=started.elapsed().as_millis() as u64,
+        "CTU timetable fetched and validated");
+    Ok(calendar)
 }
 
 pub async fn save(state: &AppState, schedule: &Schedule, source: &str) -> Result<(), ApiError> {
@@ -148,8 +165,10 @@ mod tests {
         assert_eq!(s.rooms.len(),6);
         assert_eq!(s.slots.len(),406);
         assert_eq!(s.slots.iter().find(|x|x.room_id==1 && x.date=="2026-11-05" && x.slot==1).unwrap().status,"reserved");
-        assert_eq!(s.slots.iter().find(|x|x.room_id==1 && x.date=="2026-11-13" && x.slot==1).unwrap().status,"unavailable");
+        assert_eq!(s.slots.iter().find(|x|x.room_id==1 && x.date=="2026-11-13" && x.slot==1).unwrap().status,"vacant");
+        assert_eq!(s.slots.iter().find(|x|x.room_id==1 && x.date=="2026-11-05" && x.slot==5).unwrap().status,"unavailable");
         assert_eq!(s.slots.iter().find(|x|x.room_id==1 && x.date=="2026-11-08" && x.slot==1).unwrap().status,"closed");
         assert_eq!(s.slots.iter().filter(|x| x.status=="available").count(),0);
+        assert!(s.slots.iter().any(|x| x.status=="vacant"));
     }
 }

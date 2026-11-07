@@ -62,6 +62,9 @@ pub async fn submit_for_user(state:&AppState,user:auth::User,p:BookRequest)->Res
 /// in ONE SQLite transaction, before a request can reach CTU. The link allows
 /// deterministic recovery after an app crash, without replaying a possible POST.
 pub async fn submit_for_user_with_job(state:&AppState,user:auth::User,p:BookRequest,job_id:Option<i64>)->Result<Booking,ApiError>{
+    tracing::info!(stage="validation", job_id=?job_id, user_id=user.id,
+        room_id=p.room_id, booking_date=%p.date, shift=p.slot,
+        "Starting booking validation");
     if !(5..=20).contains(&p.students){return Err(ApiError::bad("Group size must be 5–20"));}
     if p.note.chars().count()>200 {return Err(ApiError::bad("Note is too long"));}
     let date=NaiveDate::parse_from_str(&p.date,"%Y-%m-%d").map_err(|_|ApiError::bad("Use YYYY-MM-DD date"))?;
@@ -86,14 +89,31 @@ pub async fn submit_for_user_with_job(state:&AppState,user:auth::User,p:BookRequ
     let live=schedule::refresh(&state).await?;
     let source_slot=live.slots.iter().find(|s|s.room_id==p.room_id && s.date==p.date && s.slot==p.slot).cloned()
         .ok_or_else(||ApiError::bad("Slot is not present in the current CTU calendar"))?;
-    if source_slot.status!="available" {return Err(ApiError::conflict("This slot is reserved or is not open for CTU booking"));}
+    // The public CTU timetable can mark an empty cell `catrong_khl` when
+    // it is not clickable for an anonymous visitor. This is NOT a reservation.
+    // The actual booking flow rechecks the timetable after CTU login and
+    // only CTU's own confirmation is treated as a successful reservation.
+    tracing::info!(stage="public_timetable", job_id=?job_id, room_id=p.room_id,
+        booking_date=%p.date, shift=p.slot, slot_status=%source_slot.status,
+        "CTU public timetable occupancy check");
+    if !matches!(source_slot.status.as_str(), "available" | "vacant") {
+        tracing::warn!(stage="public_timetable", job_id=?job_id, room_id=p.room_id,
+            booking_date=%p.date, shift=p.slot, slot_status=%source_slot.status,
+            "Booking blocked by CTU occupancy state");
+        return Err(ApiError::conflict("CTU reports this shift as reserved, closed, expired, or unknown"));
+    }
     let room_name=live.rooms.iter().find(|r|r.id==p.room_id).map(|r|r.name.clone()).ok_or_else(ApiError::internal)?;
     // SQLite partial unique indexes provide cross-request room/slot protection.
     // The mutex also serializes same-user checks with mixed room categories.
     let _gate=state.booking_gate.lock().await;
     let conflict:i64=sqlx::query_scalar("SELECT count(*) FROM bookings WHERE user_id=? AND booking_date=? AND status IN ('pending','confirmed','uncertain') AND (slot=? OR slot>=7 OR ?>=7)")
         .bind(user.id).bind(&p.date).bind(p.slot).bind(p.slot).fetch_one(&state.db).await?;
-    if conflict>0 {return Err(ApiError::conflict("You already have an active or unverified reservation for this time/date"));}
+    if conflict>0 {
+        tracing::warn!(stage="local_conflict", job_id=?job_id, room_id=p.room_id,
+            booking_date=%p.date, shift=p.slot, conflicting_bookings=conflict,
+            "Booking blocked by existing local booking");
+        return Err(ApiError::conflict("You already have an active or unverified reservation for this time/date"));
+    }
     let mut tx = state.db.begin().await?;
     let inserted=sqlx::query("INSERT INTO bookings(user_id,room_id,booking_date,slot,students,note,status,message) VALUES(?,?,?,?,?,?,'pending','CTU submission in progress')")
         .bind(user.id).bind(p.room_id).bind(&p.date).bind(p.slot).bind(p.students).bind(&note).execute(&mut *tx).await;
@@ -111,17 +131,26 @@ pub async fn submit_for_user_with_job(state:&AppState,user:auth::User,p:BookRequ
     }
     tx.commit().await?;
     drop(_gate);
+    tracing::info!(stage="submission_started", job_id=?job_id, booking_id=id,
+        room_id=p.room_id, booking_date=%p.date, shift=p.slot,
+        "Local booking and submission marker persisted; CTU flow starting");
     // IMPORTANT: no automatic retries after POST. An absent response is ambiguous.
-    let outcome=ctu::book(&state,&user.ctu_username,&ctu_password,&source_slot,p.students,&note).await;
+    let outcome=ctu::book(&state,&user.ctu_username,&ctu_password,&source_slot,p.students,&note,id,job_id).await;
     let (status,message)=match outcome {
         Outcome::Confirmed=>("confirmed","CTU confirmed the reservation".to_string()),
         Outcome::Failed(m)=>("failed",m),
         Outcome::Uncertain(m)=>("uncertain",m),
     };
+    tracing::info!(stage="result", job_id=?job_id, booking_id=id, outcome=status,
+        "CTU booking flow completed; persisting result");
     sqlx::query("UPDATE bookings SET status=?,message=?,completed_at=? WHERE id=?")
         .bind(status).bind(&message).bind(Utc::now().timestamp()).bind(id).execute(&state.db).await?;
-    let notification=format!("{} CTU Library reservation\nRoom: {}\nDate: {}\nShift: {}\nStudents: {}\nStatus: {}\n{}",
-        if status=="confirmed"{"✅"}else if status=="failed"{"❌"}else{"⚠️"},room_name,p.date,p.slot,p.students,status,message);
+    let status_vi = match status {
+        "confirmed" => "Thành công", "failed" => "Thất bại", _ => "Chưa xác định",
+    };
+    let notification=format!("{} Kết quả đăng ký phòng CTU\nPhòng: {}\nNgày: {}\nCa: {}\nSố sinh viên: {}\nTrạng thái: {} ({})\nChi tiết: {}",
+        if status=="confirmed"{"✅"}else if status=="failed"{"❌"}else{"⚠️"},
+        room_name,p.date,p.slot,p.students,status_vi,status,message);
     // Notification delivery must never turn a confirmed CTU booking into an API error.
     if let Err(e)=telegram::enqueue(&state,id,user.id,notification).await {
         tracing::warn!(error=%e.1,booking_id=id,"Could not queue Telegram notification");

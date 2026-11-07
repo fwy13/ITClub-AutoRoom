@@ -59,3 +59,29 @@ sudo docker compose logs -f app
 ```
 
 Keep `.env` (especially its encryption key) and the `app_data` Docker volume. **Do not use `docker compose down -v`.** If upgrading from a previous version using a different Compose project name, reuse the existing volume by setting `COMPOSE_PROJECT_NAME` to the old project name in `.env` before starting; never let two active stacks share the same SQLite database. Back up SQLite with its online backup API (or `VACUUM INTO`) and store the backup off-VPS.
+
+## CTU empty slots vs bookable slots
+
+The public CTU timetable can mark a shift `catrong_khl`: **empty, but not clickable in that view**. Older ITClub-AutoRoom versions incorrectly rejected every such shift as reserved/not open. The app now labels these slots **Empty (check CTU)** and does a second timetable check with the user's CTU login session before sending an attempt. `caban` (reserved), Sundays and expired/unknown cells remain blocked. CTU itself decides whether an empty shift is eligible at that time: an empty cell is **not** a guarantee of an accepted booking. Only CTU's explicit success notice marks a reservation confirmed. An ambiguous submission is not retried automatically.
+
+Previously failed scheduled jobs (for example job #3) are not automatically replayed, since their original execution time has passed. Check the official CTU timetable and create a new attempt if the slot is still free and allowed. Rebuilding does not delete the SQLite volume.
+
+## 6. Vietnamese UI and booking diagnostics
+
+The interface defaults to **Tiếng Việt**; use the `VI` / `EN` switch in the header. Language choice is saved in the current browser. Previously stored SQLite booking records and scheduled jobs are unaffected.
+
+For detailed booking logs, add these lines to your existing `.env` (or update them), then restart the app:
+
+```dotenv
+RUST_LOG=itclub_autoroom=debug,tower_http=warn
+RUST_BACKTRACE=1
+```
+
+```bash
+sudo docker compose up -d --force-recreate app
+sudo docker compose logs --since=1h --timestamps app | grep -E 'job_id=|stage=|ITClub-AutoRoom ready'
+# To follow all logs without grep:
+sudo docker compose logs -f --tail=200 --timestamps app
+```
+
+Follow `job_id` and `stage` to see `claimed` → `preflight` → `public_timetable` → `login` → `authenticated_timetable` → `submission` → `completed`. Each check logs the room ID, target date, shift and occupancy status where relevant; HTTP requests include status and elapsed milliseconds at DEBUG level. Only a confirmed CTU success notice reports booking success. Jobs already marked `failed` are **not** automatically replayed by logging changes; check the official CTU site before creating another attempt. Never share `.env`, Telegram tokens, session cookies, or unredacted private logs.

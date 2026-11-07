@@ -94,7 +94,7 @@ async fn handle_message(state:&AppState,msg:&Value) {
     let command=parts.next().unwrap_or("");
     if !command.starts_with("/start"){return;}
     let Some(code)=parts.next() else {
-        let _=send_message(state,chat_id,"Open ITClub-AutoRoom, sign in, and choose Link Telegram to receive your personal link.").await;
+        let _=send_message(state,chat_id,"Mở ITClub-AutoRoom, đăng nhập và chọn Liên kết Telegram để lấy đường dẫn kết nối của riêng bạn.").await;
         return;
     };
     if code.len()!=64 || !code.bytes().all(|c|c.is_ascii_hexdigit()) {return;}
@@ -102,7 +102,7 @@ async fn handle_message(state:&AppState,msg:&Value) {
     let res=sqlx::query("UPDATE users SET telegram_chat_id=?,telegram_username=?,telegram_link_hash=NULL,telegram_link_expires=NULL WHERE telegram_link_hash=? AND telegram_link_expires>?")
         .bind(chat_id).bind(username).bind(crypto::digest(code)).bind(Utc::now().timestamp()).execute(&state.db).await;
     let linked=matches!(res,Ok(ref v) if v.rows_affected()==1);
-    let message=if linked {"✅ Telegram connected. You will receive reservation outcomes here."} else {"Link expired or invalid. Generate a new one in the app."};
+    let message=if linked {"✅ Đã liên kết Telegram. Bạn sẽ nhận kết quả đăng ký phòng tại đây."} else {"Liên kết đã hết hạn hoặc không hợp lệ. Hãy tạo lại liên kết trong ứng dụng."};
     let _=send_message(state,chat_id,message).await;
 }
 

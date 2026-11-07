@@ -159,6 +159,9 @@ pub async fn create(
         }
         Err(e) => return Err(e.into()),
     };
+    tracing::info!(stage="job_created", job_id=id, user_id=user.id, kind,
+        room_id=r.room_id, booking_date=%r.date, shift=r.slot, run_at,
+        "Scheduled booking saved to SQLite");
     // A new job may be earlier than the one the scheduler is sleeping for.
     state.scheduler_notify.notify_one();
     Ok((StatusCode::CREATED, Json(json!({
@@ -191,6 +194,7 @@ pub async fn cancel(State(state): State<AppState>, headers: HeaderMap, Path(id):
     let changed = sqlx::query("UPDATE scheduled_jobs SET status='cancelled',message='Cancelled by user' WHERE id=? AND user_id=? AND status='scheduled'")
         .bind(id).bind(user.id).execute(&state.db).await?;
     if changed.rows_affected() == 0 { return Err(ApiError::conflict("Job is no longer cancellable")); }
+    tracing::info!(stage="cancelled", job_id=id, "Scheduled booking cancelled by owner");
     state.scheduler_notify.notify_one();
     Ok(Json(json!({"ok":true})))
 }
@@ -202,6 +206,8 @@ pub async fn recover_processing(state: &AppState) -> Result<(), ApiError> {
     let rows = sqlx::query("SELECT id,user_id,execution_phase,booking_id FROM scheduled_jobs WHERE status='processing' ORDER BY id")
         .fetch_all(&state.db).await?;
     let now = Utc::now().timestamp();
+    tracing::info!(stage="startup_recovery", interrupted_jobs=rows.len(),
+        "Checking interrupted scheduled jobs after restart");
     for row in rows {
         let id: i64 = row.get("id");
         let user_id: i64 = row.get("user_id");
@@ -212,7 +218,8 @@ pub async fn recover_processing(state: &AppState) -> Result<(), ApiError> {
             // Requeue immediately, including jobs whose original run_at has passed.
             sqlx::query("UPDATE scheduled_jobs SET status='scheduled',run_at=MIN(run_at,?),recovery_count=recovery_count+1,recovered_at=?,message='Recovered after restart; no CTU submission had started' WHERE id=? AND status='processing'")
                 .bind(now).bind(now).bind(id).execute(&state.db).await?;
-            tracing::info!(job_id=id, "Recovered safely: preflight job scheduled again");
+            tracing::info!(stage="startup_recovery", job_id=id, prior_phase=%phase,
+                outcome="requeued", "Recovered pre-submission job safely");
         } else if let Some(bid) = booking_id {
             reconcile_linked_booking(state, id, user_id, bid, true).await?;
         } else {
@@ -220,7 +227,8 @@ pub async fn recover_processing(state: &AppState) -> Result<(), ApiError> {
             // whether a POST went out. Do not duplicate the submission.
             sqlx::query("UPDATE scheduled_jobs SET status='uncertain',execution_phase='completed',recovery_count=recovery_count+1,recovered_at=?,finished_at=?,message='Interrupted legacy/ambiguous attempt; verify on CTU before trying again' WHERE id=? AND status='processing'")
                 .bind(now).bind(now).bind(id).execute(&state.db).await?;
-            tracing::warn!(job_id=id, "Ambiguous legacy job requires verification");
+            tracing::warn!(stage="startup_recovery", job_id=id, prior_phase=%phase,
+                outcome="uncertain", "Legacy job interrupted: CTU submission must be verified");
         }
     }
     // An interactive booking could also have been interrupted; a 'pending'
@@ -289,6 +297,8 @@ async fn postpone(state: &AppState, id: i64, deadline: i64, reason: &str) -> Res
         let result = sqlx::query("UPDATE scheduled_jobs SET status='scheduled',execution_phase='preflight',run_at=?,message=? WHERE id=? AND status='processing' AND execution_phase='preflight' AND booking_id IS NULL")
             .bind(now + RETRY_INTERVAL_SECONDS).bind(reason).bind(id).execute(&state.db).await?;
         if result.rows_affected() == 1 {
+            tracing::info!(stage="preflight_retry", job_id=id, next_run_at=now + RETRY_INTERVAL_SECONDS,
+                retry_deadline=deadline, reason, "CTU slot not ready; retry scheduled without POST");
             state.scheduler_notify.notify_one();
             return Ok(true);
         }
@@ -306,21 +316,29 @@ struct DueJob {
 }
 
 async fn process_claimed(state: AppState, job: DueJob) {
+    let started = Instant::now();
     let id = job.id;
     let user_id = job.user_id;
     let req = job.request;
-    // Read-only preflight; no job should call CTU's booking endpoint until the
-    // schedule explicitly reports the requested shift as bookable.
+    tracing::info!(stage="preflight", job_id=id, kind=%job.kind,
+        room_id=req.room_id, booking_date=%req.date, shift=req.slot,
+        "Scheduled booking worker started");
+    // Read-only preflight. A slot can be vacant without being clickable in an
+    // anonymous CTU timetable. The authenticated CTU flow rechecks occupancy
+    // and CTU decides whether a submission is accepted.
     if job.kind == "prebook" {
         match schedule::refresh(&state).await {
             Ok(calendar) => {
                 let availability = calendar.slots.iter().find(|s|
                     s.room_id == req.room_id && s.date == req.date && s.slot == req.slot)
                     .map(|s| s.status.as_str());
+                tracing::info!(stage="preflight", job_id=id, room_id=req.room_id,
+                    booking_date=%req.date, shift=req.slot, slot_status=?availability,
+                    "CTU timetable preflight occupancy check");
                 match availability {
-                    Some("available") => {},
-                    Some("reserved") | Some("closed") => {
-                        finish_failure(&state,id,user_id,"CTU reports this shift as reserved or closed").await;
+                    Some("available") | Some("vacant") => {},
+                    Some("reserved") | Some("closed") | Some("unavailable") => {
+                        finish_failure(&state,id,user_id,"CTU reports this shift as reserved, closed or expired").await;
                         return;
                     }
                     _ => {
@@ -333,7 +351,9 @@ async fn process_claimed(state: AppState, job: DueJob) {
                     }
                 }
             }
-            Err(_) => {
+            Err(error) => {
+                tracing::warn!(stage="preflight", job_id=id, error=%error.1,
+                    "Live CTU timetable cannot be checked");
                 if let Some(until) = job.retry_until {
                     if matches!(postpone(&state,id,until,"Schedule unavailable; no POST sent").await,Ok(true)) {return;}
                 }
@@ -352,10 +372,18 @@ async fn process_claimed(state: AppState, job: DueJob) {
             if let Err(e) = sqlx::query("UPDATE scheduled_jobs SET status=?,message=?,booking_id=?,execution_phase='completed',finished_at=? WHERE id=? AND status='processing'")
                 .bind(&booking.status).bind(&booking.message).bind(booking.id)
                 .bind(Utc::now().timestamp()).bind(id).execute(&state.db).await {
-                tracing::error!(job_id=id,error=%e,"Booking completed but job status update failed; startup reconciliation will fix it");
+                tracing::error!(stage="persist_result", job_id=id,booking_id=booking.id,error=%e,
+                    "Booking completed but job status update failed; startup reconciliation will fix it");
+            } else {
+                tracing::info!(stage="completed", job_id=id, booking_id=booking.id,
+                    outcome=%booking.status, elapsed_ms=started.elapsed().as_millis() as u64,
+                    "Scheduled booking result persisted");
             }
         }
         Err(e) => {
+            tracing::warn!(stage="booking_error", job_id=id, http_status=e.0.as_u16(),
+                error=%e.1, elapsed_ms=started.elapsed().as_millis() as u64,
+                "Scheduled booking flow returned an error before or during submission; inspecting durable link");
             // An exception after inserting a booking row is not a failed attempt:
             // the CTU request may already have been sent. Inspect the durable link.
             let linked: Result<Option<i64>,sqlx::Error> = sqlx::query_scalar("SELECT booking_id FROM scheduled_jobs WHERE id=?")
@@ -391,7 +419,9 @@ async fn finish_failure(state: &AppState, id: i64, user_id: i64, message: &str) 
         .bind(Utc::now().timestamp()).bind(message).bind(id).execute(&state.db).await;
     match saved {
         Ok(result) if result.rows_affected()==1 => {
-            telegram::notify_job_failure(state,user_id,format!("❌ ITClub-AutoRoom scheduled booking #{id} failed: {message}")).await;
+            tracing::warn!(stage="completed", job_id=id, outcome="failed", reason=message,
+                "Scheduled booking failed before CTU submission");
+            telegram::notify_job_failure(state,user_id,format!("❌ ITClub-AutoRoom: Lịch đăng ký #{id} thất bại.\nChi tiết: {message}")).await;
         }
         Ok(_) => tracing::warn!(job_id=id,"Job changed state before recording preflight failure"),
         Err(e) => tracing::error!(job_id=id,error=%e,"Unable to persist job failure"),
@@ -408,7 +438,7 @@ async fn claim_due(state: &AppState, workers: &mut JoinSet<()>) -> Result<(), Ap
         state.scheduler_last_db_ok.store(Utc::now().timestamp(), Ordering::Relaxed);
         return Ok(());
     }
-    let rows = sqlx::query("SELECT id,user_id,room_id,booking_date,slot,students,note,borrow_tv,kind,retry_until FROM scheduled_jobs WHERE status='scheduled' AND run_at<=? ORDER BY run_at,id LIMIT ?")
+    let rows = sqlx::query("SELECT id,user_id,room_id,booking_date,slot,students,note,borrow_tv,kind,retry_until,attempts,run_at FROM scheduled_jobs WHERE status='scheduled' AND run_at<=? ORDER BY run_at,id LIMIT ?")
         .bind(Utc::now().timestamp()).bind(capacity as i64).fetch_all(&state.db).await?;
     state.scheduler_last_db_ok.store(Utc::now().timestamp(), Ordering::Relaxed);
     for row in rows {
@@ -426,7 +456,11 @@ async fn claim_due(state: &AppState, workers: &mut JoinSet<()>) -> Result<(), Ap
             },
             kind:row.get("kind"),retry_until:row.get("retry_until"),
         };
-        tracing::info!(job_id=id,"Claimed persisted scheduled booking");
+        tracing::info!(stage="claimed", job_id=id, kind=%job.kind,
+            room_id=job.request.room_id, booking_date=%job.request.date,
+            shift=job.request.slot, attempt=row.get::<i64,_>("attempts") + 1,
+            scheduled_at=row.get::<i64,_>("run_at"),
+            "Claimed scheduled job from SQLite; starting worker");
         let worker_state = state.clone();
         workers.spawn(async move {
             process_claimed(worker_state.clone(),job).await;
@@ -478,6 +512,9 @@ fn handle_worker_result(joined: Result<(), tokio::task::JoinError>) {
 /// the API updates the queue or a worker finishes, and periodically verifies
 /// database health. Startup has already reconciled interrupted submissions.
 pub async fn loop_jobs(state: AppState) {
+    tracing::info!(stage="scheduler", watchdog_seconds=WATCHDOG_SCAN_SECONDS,
+        max_parallel_jobs=MAX_CONCURRENT_JOBS,
+        "Event-driven scheduler started; waiting for SQLite deadlines");
     let mut watchdog = tokio::time::interval(TokioDuration::from_secs(WATCHDOG_SCAN_SECONDS));
     watchdog.set_missed_tick_behavior(MissedTickBehavior::Skip);
     watchdog.tick().await; // Consume the immediate first tick; next recovery check is in 30s.
