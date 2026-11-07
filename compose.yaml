@@ -1,0 +1,33 @@
+name: itclub-autoroom
+
+services:
+  app:
+    build: .
+    restart: always
+    env_file: .env
+    init: true
+    stop_grace_period: 30s
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - app_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:3000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    restart: always
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN:-MISSING_TUNNEL_TOKEN}
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  app_data:
