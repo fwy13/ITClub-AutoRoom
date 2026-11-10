@@ -129,6 +129,7 @@ pub async fn create(
         }
         Err(e) => return Err(e.into()),
     };
+    
     tracing::info!(stage="job_created", job_id=id, user_id=user.id, kind,
         room_id=r.room_id, booking_date=%r.date, shift=r.slot, run_at,
         "Scheduled booking saved to SQLite");
