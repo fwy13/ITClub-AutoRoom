@@ -170,11 +170,143 @@ pub async fn book(
     }
 }
 
+/// Cancellation is a distinct one-shot CTU operation. The form uses multipart
+/// boundary encoding ("form-data"), not the urlencoded booking/login format.
+#[derive(Debug)]
+pub enum CancellationOutcome { Confirmed, Rejected(String), Uncertain(String) }
+
+#[tracing::instrument(name="ctu_cancellation", skip(state, username, password),
+    fields(room_id, shift, booking_date))]
+pub async fn cancel(
+    state: &AppState, username: &str, password: &str,
+    room_id: i64, shift: i64, date: &str,
+) -> CancellationOutcome {
+    let date = match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(d) => d.format("%d-%m-%Y").to_string(),
+        Err(_) => return CancellationOutcome::Rejected("Invalid booking date".into()),
+    };
+    let mut jar = CookieJar::default();
+    // A failure before the cancellation POST is safe to report as rejected:
+    // no cancellation could have been submitted to CTU.
+    match request(state, &mut jar, "", None).await {
+        Ok((200..=299, _)) => {},
+        _ => return CancellationOutcome::Rejected("Cannot initialize CTU cancellation session".into()),
+    }
+    match request(state, &mut jar, "dangnhap.php", Some(&[
+        ("txtusername", username), ("txtpassword", password),
+    ])).await {
+        Ok((200..=299, body)) if notice(&body, "Xin chào :)") => {},
+        _ => return CancellationOutcome::Rejected("CTU login was not confirmed; cancellation was not submitted".into()),
+    }
+
+    let endpoint = format!("{}/huydk.php", state.cfg.ctu_base.trim_end_matches('/'));
+    let form = reqwest::multipart::Form::new()
+        .text("id_p", room_id.to_string())
+        .text("id_c", shift.to_string())
+        .text("ngay_hoc", date);
+    let mut builder = state.http.post(endpoint)
+        .header(ACCEPT, "*/*")
+        .header("X-Requested-With", "XMLHttpRequest")
+        .header(ORIGIN, "https://libapp.ctu.edu.vn")
+        .header(REFERER, format!("{}/", state.cfg.ctu_base.trim_end_matches('/')))
+        .multipart(form);
+    let cookie = jar.header();
+    if !cookie.is_empty() { builder = builder.header(COOKIE, cookie); }
+    // From this point even a timeout can mean CTU processed the cancellation.
+    // Exactly one POST; do not retry automatically under any circumstances.
+    tracing::info!(stage="cancellation_submission", "Sending one authenticated CTU multipart POST");
+    let response = match builder.send().await {
+        Ok(response) => response,
+        Err(_) => return CancellationOutcome::Uncertain(
+            "CTU cancellation response was lost; verify on the official site".into()),
+    };
+    let code = response.status();
+    let body = match response.text().await {
+        Ok(body) => body,
+        Err(_) => return CancellationOutcome::Uncertain(
+            "Unable to read CTU cancellation response; verify on the official site".into()),
+    };
+    if code.is_success() && notice(&body, "Hủy thành công :)") {
+        tracing::info!(stage="cancellation_submission", outcome="confirmed", "CTU confirmed cancellation");
+        return CancellationOutcome::Confirmed;
+    }
+    // Only an explicit negative notice counts as a definite rejection.
+    // Unknown HTML and non-2xx responses remain ambiguous after POST.
+    if code.is_success() && has_error_notice(&body) {
+        return CancellationOutcome::Rejected("CTU explicitly rejected cancellation; the booking remains confirmed".into());
+    }
+    tracing::warn!(stage="cancellation_submission", outcome="uncertain", http_status=%code,
+        "CTU did not provide the exact cancellation success notice");
+    CancellationOutcome::Uncertain(
+        "CTU did not confirm cancellation; verify on the official site before another attempt".into())
+}
+
+fn has_error_notice(body: &str) -> bool {
+    let html = Html::parse_fragment(body);
+    let selector = Selector::parse("div.tb_err, div.tb_error").unwrap();
+    html.select(&selector).any(|node| node.text().any(|text| !text.trim().is_empty()))
+}
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cancellation_is_authenticated_multipart_with_exact_fields() {
+        use crate::{config::Config, state::AppState};
+        use axum::{body::Bytes, http::HeaderMap, routing::{get, post}, Router};
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::{sync::{Arc, atomic::AtomicI64}, time::Duration};
+        use tokio::sync::Mutex;
+        let seen = Arc::new(Mutex::new(None::<(String, String, String)>));
+        let recording = Arc::clone(&seen);
+        let app = Router::new()
+            .route("/dkptl/", get(|| async {
+                ([(axum::http::header::SET_COOKIE, "PHPSESSID=mock-session; Path=/")], "ready")
+            }))
+            .route("/dkptl/dangnhap.php", post(|| async { "<div class='tb_ok'>Xin chào :)</div>" }))
+            .route("/dkptl/huydk.php", post(move |headers: HeaderMap, body: Bytes| {
+                let recording = Arc::clone(&recording);
+                async move {
+                    let typ = headers.get(axum::http::header::CONTENT_TYPE).unwrap().to_str().unwrap().to_string();
+                    let cookie = headers.get(axum::http::header::COOKIE).unwrap().to_str().unwrap().to_string();
+                    let raw = String::from_utf8(body.to_vec()).unwrap();
+                    *recording.lock().await = Some((typ,cookie,raw));
+                    "<div class='tb_ok'>Hủy thành công :)</div>"
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let db = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        let cfg = Config {
+            bind:"127.0.0.1:0".into(), database_url:"sqlite::memory:".into(),
+            encryption_key:[0;32], ctu_base:format!("http://{addr}/dkptl"),
+            allowed_origins:vec![], cookie_secure:false, telegram_token:None,
+            telegram_username:None, refresh_secs:120, seed_fixture:false,
+        };
+        let state=AppState {
+            db, http:reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap(),
+            cfg:Arc::new(cfg), booking_gate:Arc::new(Mutex::new(())), sync_gate:Arc::new(Mutex::new(())),
+            scheduler_heartbeat:Arc::new(AtomicI64::new(0)), scheduler_last_db_ok:Arc::new(AtomicI64::new(0)),
+            scheduler_notify:Arc::new(tokio::sync::Notify::new()),
+        };
+        let result = super::cancel(&state,"student","password",1,1,"2026-11-23").await;
+        assert!(matches!(result, super::CancellationOutcome::Confirmed));
+        let (content_type,cookie,body) = seen.lock().await.clone().unwrap();
+        assert!(content_type.starts_with("multipart/form-data; boundary="));
+        assert!(cookie.contains("PHPSESSID=mock-session"));
+        for (name,value) in [("id_p","1"),("id_c","1"),("ngay_hoc","23-11-2026")] {
+            assert!(body.contains(&format!("name=\"{name}\"")));
+            assert!(body.contains(&format!("\r\n\r\n{value}\r\n")));
+        }
+        server.abort();
+    }
+
     #[test]
     fn success_must_match_explicit_ctu_notice() {
         assert!(super::notice("<div class='tb_ok'>Đăng ký thành công :)</div>","Đăng ký thành công :)"));
         assert!(!super::notice("<div class='tb_err'>Đăng ký thành công :)</div>","Đăng ký thành công :)"));
+        assert!(super::notice("<div class='tb_ok'>Hủy thành công :)</div>", "Hủy thành công :)"));
+        assert!(!super::notice("<div class='tb_ok'>Không thành công</div>", "Hủy thành công :)"));
+        assert!(super::has_error_notice("<div class='tb_err'>Không thể hủy</div>"));
     }
 }

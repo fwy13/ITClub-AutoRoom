@@ -8,6 +8,7 @@ mod jobs;
 mod schedule;
 mod state;
 mod telegram;
+mod window;
 
 use axum::{routing::{get,post}, Router};
 use config::Config;
@@ -85,6 +86,7 @@ async fn main()->Result<(),Box<dyn std::error::Error>>{
         .route("/api/schedule",get(api::get_schedule))
         .route("/api/schedule/refresh",post(api::refresh_schedule))
         .route("/api/bookings",get(api::my_bookings).post(api::create_booking))
+        .route("/api/bookings/{id}/cancel",post(api::cancel_booking))
         .route("/api/jobs",get(jobs::list).post(jobs::create))
         .route("/api/jobs/{id}",axum::routing::delete(jobs::cancel))
         .route("/api/telegram/link",post(telegram::create_link))

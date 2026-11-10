@@ -1,5 +1,5 @@
-use crate::{auth, crypto, ctu::{self,Outcome}, error::ApiError, schedule, state::AppState, telegram};
-use axum::{extract::State, http::{HeaderMap,StatusCode}, Json};
+use crate::{auth, crypto, ctu::{self,Outcome}, error::ApiError, schedule, state::AppState, telegram, window};
+use axum::{extract::{Path,State}, http::{HeaderMap,StatusCode}, Json};
 use chrono::{Timelike,Duration,Utc,NaiveDate};
 use serde::{Deserialize,Serialize};
 use serde_json::{Value,json};
@@ -38,7 +38,7 @@ pub async fn refresh_schedule(State(state):State<AppState>,headers:HeaderMap)->R
 }
 pub async fn my_bookings(State(state):State<AppState>,headers:HeaderMap)->Result<Json<Vec<Booking>>,ApiError>{
     let u=auth::authenticate(&state,&headers).await?;
-    let rows=sqlx::query("SELECT b.id,b.room_id,r.name AS room_name,b.booking_date,b.slot,b.students,b.note,b.status,b.message,b.created_at FROM bookings b JOIN rooms r ON r.id=b.room_id WHERE b.user_id=? ORDER BY b.created_at DESC,b.id DESC LIMIT 100")
+    let rows=sqlx::query("SELECT b.id,b.room_id,r.name AS room_name,b.booking_date,b.slot,b.students,b.note,CASE b.cancellation_status WHEN 'processing' THEN 'cancelling' WHEN 'uncertain' THEN 'cancel_uncertain' WHEN 'cancelled' THEN 'cancelled' ELSE b.status END AS status,b.message,b.created_at FROM bookings b JOIN rooms r ON r.id=b.room_id WHERE b.user_id=? ORDER BY b.created_at DESC,b.id DESC LIMIT 100")
         .bind(u.id).fetch_all(&state.db).await?;
     let bookings=rows.into_iter().map(|r|Booking{
         id:r.get("id"),room_id:r.get("room_id"),room_name:r.get("room_name"),date:r.get("booking_date"),slot:r.get("slot"),
@@ -68,9 +68,12 @@ pub async fn submit_for_user_with_job(state:&AppState,user:auth::User,p:BookRequ
     if !(5..=20).contains(&p.students){return Err(ApiError::bad("Group size must be 5–20"));}
     if p.note.chars().count()>200 {return Err(ApiError::bad("Note is too long"));}
     let date=NaiveDate::parse_from_str(&p.date,"%Y-%m-%d").map_err(|_|ApiError::bad("Use YYYY-MM-DD date"))?;
-    let vn_today=(Utc::now()+Duration::hours(7)).date_naive();
-    if date<vn_today {return Err(ApiError::bad("Cannot book a date in the past"));}
-    if date>vn_today+Duration::days(13) {return Err(ApiError::bad("CTU bookings open at most 13 days before the target date; create a pre-booking instead"));}
+    let vn_today=window::today_vn(Utc::now());
+    match window::classify(date, vn_today) {
+        window::Window::Immediate => {},
+        window::Window::Advance => return Err(ApiError::bad("For dates A+14 through A+44, create an advance booking")),
+        window::Window::Outside => return Err(ApiError::bad("Immediate bookings are allowed from today through A+13 only")),
+    }
     let shift_valid=match p.room_id {1..=3 => (1..=6).contains(&p.slot),4 => (7..=9).contains(&p.slot),5..=6 => (10..=13).contains(&p.slot),_=>false};
     if !shift_valid {return Err(ApiError::bad("Invalid room/shift combination"));}
     // For the six standard slots, also reject shifts that have already finished today.
@@ -106,7 +109,7 @@ pub async fn submit_for_user_with_job(state:&AppState,user:auth::User,p:BookRequ
     // SQLite partial unique indexes provide cross-request room/slot protection.
     // The mutex also serializes same-user checks with mixed room categories.
     let _gate=state.booking_gate.lock().await;
-    let conflict:i64=sqlx::query_scalar("SELECT count(*) FROM bookings WHERE user_id=? AND booking_date=? AND status IN ('pending','confirmed','uncertain') AND (slot=? OR slot>=7 OR ?>=7)")
+    let conflict:i64=sqlx::query_scalar("SELECT count(*) FROM bookings WHERE user_id=? AND booking_date=? AND status IN ('pending','confirmed','uncertain') AND cancellation_status <> 'cancelled' AND (slot=? OR slot>=7 OR ?>=7)")
         .bind(user.id).bind(&p.date).bind(p.slot).bind(p.slot).fetch_one(&state.db).await?;
     if conflict>0 {
         tracing::warn!(stage="local_conflict", job_id=?job_id, room_id=p.room_id,
@@ -114,6 +117,9 @@ pub async fn submit_for_user_with_job(state:&AppState,user:auth::User,p:BookRequ
             "Booking blocked by existing local booking");
         return Err(ApiError::conflict("You already have an active or unverified reservation for this time/date"));
     }
+    let queued:i64=sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_jobs WHERE room_id=? AND booking_date=? AND slot=? AND status IN ('scheduled','processing') AND id != ?")
+        .bind(p.room_id).bind(&p.date).bind(p.slot).bind(job_id.unwrap_or(-1)).fetch_one(&state.db).await?;
+    if queued > 0 { return Err(ApiError::conflict("An advance booking already holds this room/shift locally")); }
     let mut tx = state.db.begin().await?;
     let inserted=sqlx::query("INSERT INTO bookings(user_id,room_id,booking_date,slot,students,note,status,message) VALUES(?,?,?,?,?,?,'pending','CTU submission in progress')")
         .bind(user.id).bind(p.room_id).bind(&p.date).bind(p.slot).bind(p.students).bind(&note).execute(&mut *tx).await;
@@ -158,4 +164,60 @@ pub async fn submit_for_user_with_job(state:&AppState,user:auth::User,p:BookRequ
     let state_for_notification=state.clone();
     tokio::spawn(async move {telegram::deliver_pending(&state_for_notification).await;});
     Ok(Booking{id,room_id:p.room_id,room_name,date:p.date,slot:p.slot,students:p.students,note,status:status.to_string(),message,created_at:Utc::now().timestamp()})
+}
+
+/// Cancel only a booking belonging to the authenticated app user, using that
+/// user's own CTU credentials. A cancellation is a one-shot operation: persist
+/// its intent before any network I/O and never blindly replay on restart.
+pub async fn cancel_booking(
+    State(state): State<AppState>, headers: HeaderMap, Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiError> {
+    auth::check_origin(&headers, &state)?;
+    let user = auth::authenticate(&state, &headers).await?;
+    let _gate = state.booking_gate.lock().await;
+    let row = sqlx::query(
+        "SELECT room_id,booking_date,slot,status,cancellation_status FROM bookings WHERE id=? AND user_id=?"
+    ).bind(id).bind(user.id).fetch_optional(&state.db).await?
+        .ok_or_else(|| ApiError::bad("Booking not found"))?;
+    let status: String = row.get("status");
+    let cancellation: String = row.get("cancellation_status");
+    if status != "confirmed" || cancellation != "none" {
+        return Err(ApiError::conflict("Only confirmed, not-yet-cancelled reservations can be cancelled"));
+    }
+    // Validate credentials before marking the one-shot cancellation attempt.
+    let password = crypto::decrypt(&state.cfg.encryption_key, &user.ctu_password_ciphertext)
+        .map_err(|_| ApiError::internal())?;
+    let now = Utc::now().timestamp();
+    let changed = sqlx::query(
+        "UPDATE bookings SET cancellation_status='processing',cancel_started_at=?,message='Cancellation submitted; awaiting CTU confirmation' WHERE id=? AND user_id=? AND status='confirmed' AND cancellation_status='none'"
+    ).bind(now).bind(id).bind(user.id).execute(&state.db).await?;
+    if changed.rows_affected() != 1 { return Err(ApiError::conflict("Cancellation has already started")); }
+    drop(_gate);
+
+    let room_id: i64 = row.get("room_id");
+    let slot: i64 = row.get("slot");
+    let date: String = row.get("booking_date");
+    let outcome = ctu::cancel(&state, &user.ctu_username, &password,
+        room_id, slot, &date).await;
+    let (cancel_status, public_status, message) = match outcome {
+        ctu::CancellationOutcome::Confirmed => ("cancelled", "cancelled", "CTU confirmed cancellation".to_string()),
+        ctu::CancellationOutcome::Rejected(msg) => ("none", "confirmed", msg),
+        ctu::CancellationOutcome::Uncertain(msg) => ("uncertain", "cancel_uncertain", msg),
+    };
+    // If this UPDATE fails, startup recovery will conservatively record an
+    // uncertain cancellation, and the UI must not offer a second POST.
+    sqlx::query(
+        "UPDATE bookings SET cancellation_status=?,message=?,cancelled_at=CASE WHEN ?='cancelled' THEN ? ELSE cancelled_at END WHERE id=? AND user_id=? AND cancellation_status='processing'"
+    ).bind(cancel_status).bind(&message).bind(cancel_status).bind(Utc::now().timestamp())
+     .bind(id).bind(user.id).execute(&state.db).await?;
+    tracing::info!(booking_id=id, user_id=user.id, outcome=public_status, "CTU cancellation result persisted");
+    // Cancellation is a second event for this booking. The existing notification
+    // table allows only one row per booking_id, so send this event separately.
+    let notify_state = state.clone();
+    let notify_user = user.id;
+    let notify_message = format!("CTU cancellation #{}: {}. {}", id, public_status, message);
+    tokio::spawn(async move {
+        telegram::notify_job_failure(&notify_state, notify_user, notify_message).await;
+    });
+    Ok(Json(json!({"id":id,"status":public_status,"message":message})))
 }

@@ -1,6 +1,6 @@
 # ITClub-AutoRoom
 
-Rust/Axum + Tokio, SQLite, React/TypeScript/Tailwind CSS. Supports **Discussion Rooms A, B, C**, the other CTU library rooms, 13-day pre-booking, Telegram notifications, and automatic job recovery.
+Rust/Axum + Tokio, SQLite, React/TypeScript/Tailwind CSS. Supports **Discussion Rooms A, B, C**, the other CTU library rooms, immediate/advance booking windows, authenticated CTU room cancellation, Telegram notifications, and automatic job recovery.
 
 ## 1. Deploy on a Linux VPS
 
@@ -45,20 +45,64 @@ sudo docker compose logs --tail=100 -f app cloudflared
 
 Create a bot with BotFather and configure `TELEGRAM_BOT_TOKEN` and `TELEGRAM_BOT_USERNAME` in `.env`, then run `sudo docker compose up -d --force-recreate`. Users link the bot in the **Telegram & account** tab before receiving private booking notifications.
 
-## 4. Schedule jobs and recovery
+## 4. Reservation windows and persistent scheduler
 
-Use **Pre-book 13 days ahead** to select Day A, a room, shift, and the *actual* CTU opening hour in Vietnam time. SQLite stores the calculated Day A − 13 days timestamp. The event-driven Tokio scheduler sleeps until that deadline, wakes on job creation/cancellation, and runs a lightweight 30-second recovery/health check. It does **not** continuously poll SQLite every 2 seconds.
+All boundaries are **inclusive calendar days in Vietnam (UTC+07)**. Let **A = today**:
 
-`restart: always` restarts a crashed container when Docker is running. On startup, pending and overdue jobs are considered; interrupted read-only checks are safely rescheduled. An attempt that might already have reached CTU is marked `uncertain`, **not** automatically submitted again. Booking success always requires CTU confirmation. A powered-off VPS cannot execute jobs until it comes back online. This deployment runs only **one** app instance with **one** SQLite volume.
+| Target date | Action | API |
+| --- | --- | --- |
+| A to A+13 | Attempt **immediately**. No booking/opening-time field required | `POST /api/bookings` |
+| A+14 to A+44 (B=A+14, up to B+30) | Create a persistent advance job | `POST /api/jobs` with `kind: "prebook"` |
+| Before A or after A+44 | Rejected | — |
 
-## 5. Update and preserve data
+Advance jobs accept `room_id`, `date` (`YYYY-MM-DD`), `slot`, `students`, `note`, `borrow_tv` and optional `kind: "prebook"`. **Do not send** `run_at` or `open_time_vn`: the app automatically computes a *checking start* of **00:00 ICT, 13 calendar days before the target date**. CTU's official booking-opening hour is **not established by the supplied HTML**; midnight does **not** guarantee bookings have opened. If the target slot is not visible/not open or the calendar is temporarily inaccessible, the scheduler rechecks at most every five minutes during its first eligible day. It never resends a POST that may already have reached CTU. An advance job is **not a confirmed booking**.
+
+Existing manual/scheduled jobs from older versions are preserved and executed at their stored timestamps; the new API only creates advance jobs. `restart: always` restarts a crashed container when Docker is running. Pending/overdue jobs are retained in SQLite. Recovery safely requeues interrupted read-only checks, while possible CTU submissions become `uncertain`, never repeated blindly. The scheduler is deadline-based (30-second health backstop), not a 2-second poll. A powered-off VPS cannot execute jobs until restored.
+
+### Cancel a confirmed CTU reservation
+
+In **My bookings**, click **Cancel CTU reservation** on a confirmed booking and confirm. Alternatively, while signed in, call:
+
+```http
+POST /api/bookings/{booking_id}/cancel
+```
+
+The backend verifies the app-session owner, opens an authenticated CTU session with **that user's** stored CTU credentials, and sends **one** multipart/form-data request to `https://libapp.ctu.edu.vn/dkptl/huydk.php` containing:
+
+```text
+id_p=1
+id_c=1
+ngay_hoc=23-11-2026
+```
+
+These values are derived from the selected booking, not accepted as arbitrary user-supplied cancellation identifiers. Only CTU's exact `<div class='tb_ok'>Hủy thành công :)</div>` success notice releases the slot locally. A clear upstream error leaves the reservation confirmed; an ambiguous response or a crash during a potential POST becomes `cancel_uncertain` and **keeps the local slot occupied**. Never send a second cancellation automatically; check CTU's official website first.
+
+`DELETE /api/jobs/{id}` only cancels a queued *advance job*, not a confirmed CTU reservation.
+
+## 5. Apply the patch to an existing checkout
+
+This patch was generated against the **exact source snapshot provided as Repomix XML**. It is not a patch against arbitrary revisions of the project. First commit or stash your own changes, then check compatibility **without modifying files**:
+
+```bash
+# Run from the repository root; point to the downloaded .patch file.
+git apply --check /path/to/ITClub-AutoRoom-booking-redesign-v2.patch
+# Only if the check exits with code 0:
+git apply /path/to/ITClub-AutoRoom-booking-redesign-v2.patch
+# Make a commit in your own repository:
+git add README.md server web
+git commit -m "feat: redesign reservation horizons and add CTU cancellation"
+```
+
+If you want Git to preserve the supplied commit message and author, use `git am /path/to/ITClub-AutoRoom-booking-redesign-v2.mbox` **instead of** `git apply` (not both). If you see `patch does not apply`, the current checkout differs from the uploaded snapshot, or the patch is already present. Check `git status` and `git apply --reverse --check <file>` before taking further action. Do not force the patch with `--reject` on a production deployment: use the full-source archive to compare and merge changes safely.
+
+## 6. Update and preserve data
 
 ```bash
 sudo docker compose up -d --build
 sudo docker compose logs -f app
 ```
 
-Keep `.env` (especially its encryption key) and the `app_data` Docker volume. **Do not use `docker compose down -v`.** If upgrading from a previous version using a different Compose project name, reuse the existing volume by setting `COMPOSE_PROJECT_NAME` to the old project name in `.env` before starting; never let two active stacks share the same SQLite database. Back up SQLite with its online backup API (or `VACUUM INTO`) and store the backup off-VPS.
+The SQLite migration `0006_cancellation.sql` is applied automatically on startup. Back up the database first. Keep `.env` (especially its encryption key) and the `app_data` Docker volume. **Do not use `docker compose down -v`.** If upgrading from a previous version using a different Compose project name, reuse the existing volume by setting `COMPOSE_PROJECT_NAME` to the old project name in `.env` before starting; never let two active stacks share the same SQLite database. Back up SQLite with its online backup API (or `VACUUM INTO`) and store the backup off-VPS.
 
 ## CTU empty slots vs bookable slots
 
@@ -66,7 +110,7 @@ The public CTU timetable can mark a shift `catrong_khl`: **empty, but not clicka
 
 Previously failed scheduled jobs (for example job #3) are not automatically replayed, since their original execution time has passed. Check the official CTU timetable and create a new attempt if the slot is still free and allowed. Rebuilding does not delete the SQLite volume.
 
-## 6. Vietnamese UI and booking diagnostics
+## 7. Vietnamese UI and booking diagnostics
 
 The interface defaults to **Tiếng Việt**; use the `VI` / `EN` switch in the header. Language choice is saved in the current browser. Previously stored SQLite booking records and scheduled jobs are unaffected.
 

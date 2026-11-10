@@ -1,19 +1,18 @@
-use crate::{api::{self, BookRequest}, auth, error::ApiError, schedule, state::AppState, telegram};
+use crate::{api::{self, BookRequest}, auth, error::ApiError, schedule, state::AppState, telegram, window};
 use axum::{extract::{Path, State}, http::{HeaderMap, StatusCode}, Json};
 use std::sync::atomic::Ordering;
 use tokio::task::JoinSet;
-use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
 use tokio::time::{Duration as TokioDuration, Instant, MissedTickBehavior};
 
-// Pre-booking is based on the *target booking date* in Vietnam, not the server timezone.
-// CTU's precise opening hour is not contained in the uploaded HTML: users specify it.
-const PREBOOK_ADVANCE_DAYS: i64 = 13;
-const MAX_TARGET_DAYS: i64 = 90;
-const RETRY_WINDOW_SECONDS: i64 = 180;
-const RETRY_INTERVAL_SECONDS: i64 = 15;
+// Start checking at the first eligible midnight; CTU's actual opening hour is
+// not documented in the supplied source. Avoid assuming that midnight is open.
+// Only pre-submission checks may retry. After a possible POST, never retry.
+const RETRY_WINDOW_SECONDS: i64 = 24 * 3600 - 60;
+const RETRY_INTERVAL_SECONDS: i64 = 5 * 60;
 // The normal scheduler sleeps until the next due job. This is only a recovery/health backstop.
 const WATCHDOG_SCAN_SECONDS: u64 = 30;
 const ERROR_BACKOFF_SECONDS: u64 = 5;
@@ -54,20 +53,6 @@ pub struct Job {
     booking_id: Option<i64>,
 }
 
-fn vietnam_now_date(now: &DateTime<Utc>) -> NaiveDate {
-    (now.to_owned() + Duration::hours(7)).date_naive()
-}
-
-fn prebook_open_timestamp(target: NaiveDate, time: &str) -> Result<i64, ApiError> {
-    let open_time = NaiveTime::parse_from_str(time, "%H:%M")
-        .map_err(|_| ApiError::bad("open_time_vn must be a 24-hour HH:MM time in Vietnam"))?;
-    let day = target.checked_sub_signed(Duration::days(PREBOOK_ADVANCE_DAYS))
-        .ok_or_else(|| ApiError::bad("Invalid target date"))?;
-    let vietnam = FixedOffset::east_opt(7 * 3600).expect("valid UTC+07 offset");
-    let local = day.and_time(open_time);
-    Ok(local.and_local_timezone(vietnam).single().expect("valid fixed-offset datetime").timestamp())
-}
-
 pub async fn create(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -90,46 +75,20 @@ pub async fn create(
     let date = NaiveDate::parse_from_str(&r.date, "%Y-%m-%d")
         .map_err(|_| ApiError::bad("Invalid target date"))?;
     let now = Utc::now();
-    let today = vietnam_now_date(&now);
-    if date < today || date > today + Duration::days(MAX_TARGET_DAYS) {
-        return Err(ApiError::bad("Target date must be within the next 90 days"));
+    let today = window::today_vn(now);
+    if window::classify(date, today) != window::Window::Advance {
+        return Err(ApiError::bad("Advance booking dates must be from A+14 through A+44 (Vietnam time)"));
     }
-
-    let kind = p.kind.as_deref().unwrap_or("manual");
-    let (run_at, opens_at, retry_until) = match kind {
-        "prebook" => {
-            if p.run_at.is_some() {
-                return Err(ApiError::bad("Pre-booking calculates run_at automatically; omit run_at"));
-            }
-            let opening = p.open_time_vn.as_deref()
-                .ok_or_else(|| ApiError::bad("Choose the CTU opening time in Vietnam (HH:MM)"))?;
-            let at = prebook_open_timestamp(date, opening)?;
-            if at <= now.timestamp() + 10 {
-                return Err(ApiError::bad("The 13-day pre-booking time has already passed; choose a later date or time"));
-            }
-            (at, Some(at), Some(at + RETRY_WINDOW_SECONDS))
-        }
-        "manual" => {
-            if p.open_time_vn.is_some() {
-                return Err(ApiError::bad("open_time_vn is only valid for pre-booking"));
-            }
-            let when = p.run_at.as_deref()
-                .ok_or_else(|| ApiError::bad("run_at is required for manual scheduled attempts"))?;
-            let at = DateTime::parse_from_rfc3339(when)
-                .map_err(|_| ApiError::bad("run_at must be ISO8601 with a timezone"))?.timestamp();
-            if at <= now.timestamp() + 10 || at > now.timestamp() + 45 * 86400 {
-                return Err(ApiError::bad("Attempt time must be between 10 seconds and 45 days from now"));
-            }
-            // The window opens no earlier than midnight 13 days before the target date.
-            // This is a lower bound; actual CTU opening hour may be later.
-            let earliest = prebook_open_timestamp(date, "00:00")?;
-            if at < earliest {
-                return Err(ApiError::bad("Cannot schedule an attempt more than 13 days before the target date"));
-            }
-            (at, None, None)
-        }
-        _ => return Err(ApiError::bad("kind must be manual or prebook")),
-    };
+    if p.kind.as_deref().unwrap_or("prebook") != "prebook" {
+        return Err(ApiError::bad("Use /api/bookings for immediate reservations; only prebook jobs can be created"));
+    }
+    if p.run_at.is_some() || p.open_time_vn.is_some() {
+        return Err(ApiError::bad("Advance bookings are automatic; do not supply run_at or open_time_vn"));
+    }
+    let run_at = window::starts_at(date).ok_or_else(|| ApiError::bad("Invalid target date"))?;
+    let opens_at = Some(run_at);
+    let retry_until = Some(run_at + RETRY_WINDOW_SECONDS);
+    let kind = "prebook";
 
     let target_end = date.and_hms_opt(23, 59, 59).expect("valid date").and_utc().timestamp() - 7 * 3600;
     if run_at > target_end {
@@ -140,11 +99,22 @@ pub async fn create(
     if exists.is_none() { return Err(ApiError::bad("Room is not loaded yet; refresh schedule")); }
     // A pre-booking is a future attempt, but do not allow one for a slot already
     // held locally (including an ambiguous upstream submission).
+    let _gate = state.booking_gate.lock().await;
     let active: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM bookings WHERE room_id=? AND booking_date=? AND slot=? AND status IN ('pending','confirmed','uncertain')"
+        "SELECT count(*) FROM bookings WHERE room_id=? AND booking_date=? AND slot=? AND status IN ('pending','confirmed','uncertain') AND cancellation_status <> 'cancelled'"
     ).bind(r.room_id).bind(&r.date).bind(r.slot).fetch_one(&state.db).await?;
     if active > 0 { return Err(ApiError::conflict("This room/shift is already booked or awaiting confirmation")); }
 
+    // Single-instance booking_gate serializes advance creation and direct booking.
+    // A booking held by another user's queue must not be double-scheduled.
+    let reserved_job: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduled_jobs WHERE room_id=? AND booking_date=? AND slot=? AND status IN ('scheduled','processing')"
+    ).bind(r.room_id).bind(&r.date).bind(r.slot).fetch_one(&state.db).await?;
+    if reserved_job > 0 { return Err(ApiError::conflict("An advance booking already holds this room/shift locally")); }
+    let overlapping_job: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduled_jobs WHERE user_id=? AND booking_date=? AND status IN ('scheduled','processing') AND (slot=? OR slot>=7 OR ?>=7)"
+    ).bind(user.id).bind(&r.date).bind(r.slot).bind(r.slot).fetch_one(&state.db).await?;
+    if overlapping_job > 0 { return Err(ApiError::conflict("You already have an overlapping advance booking")); }
     let inserted = sqlx::query(
         "INSERT INTO scheduled_jobs(user_id,room_id,booking_date,slot,students,note,borrow_tv,run_at,kind,opens_at,retry_until) VALUES(?,?,?,?,?,?,?,?,?,?,?)"
     )
@@ -203,6 +173,12 @@ pub async fn cancel(State(state): State<AppState>, headers: HeaderMap, Path(id):
 // remain authoritative. Only work that was interrupted *while processing* needs
 // special treatment. The phase is recorded before any possible upstream POST.
 pub async fn recover_processing(state: &AppState) -> Result<(), ApiError> {
+    // An interrupted cancellation may have reached CTU. Never send it twice.
+    let interrupted = sqlx::query("UPDATE bookings SET cancellation_status='uncertain',message='Server restarted during cancellation; verify on CTU before retrying' WHERE cancellation_status='processing'")
+        .execute(&state.db).await?;
+    if interrupted.rows_affected() > 0 {
+        tracing::warn!(count=interrupted.rows_affected(), "Interrupted CTU cancellations marked uncertain");
+    }
     let rows = sqlx::query("SELECT id,user_id,execution_phase,booking_id FROM scheduled_jobs WHERE status='processing' ORDER BY id")
         .fetch_all(&state.db).await?;
     let now = Utc::now().timestamp();
@@ -337,11 +313,11 @@ async fn process_claimed(state: AppState, job: DueJob) {
                     "CTU timetable preflight occupancy check");
                 match availability {
                     Some("available") | Some("vacant") => {},
-                    Some("reserved") | Some("closed") | Some("unavailable") => {
-                        finish_failure(&state,id,user_id,"CTU reports this shift as reserved, closed or expired").await;
+                    Some("reserved") | Some("closed") => {
+                        finish_failure(&state,id,user_id,"CTU reports this shift as reserved or closed").await;
                         return;
                     }
-                    _ => {
+                    Some("unavailable") | None => {
                         let reason = "Waiting for CTU to open this slot (no booking POST sent)";
                         if let Some(until) = job.retry_until {
                             if matches!(postpone(&state,id,until,reason).await,Ok(true)) {return;}
@@ -605,6 +581,8 @@ mod tests {
             sqlx::query("UPDATE scheduled_jobs SET booking_id=? WHERE id=?")
                 .bind(inserted.last_insert_rowid()).bind(id).execute(&db).await.unwrap();
         }
+        sqlx::query("INSERT INTO bookings(user_id,room_id,booking_date,slot,students,note,status,cancellation_status) VALUES(1,1,'2026-12-02',5,5,'Cancel','confirmed','processing')")
+            .execute(&db).await.unwrap();
         let cfg = Config {
             bind:"127.0.0.1:0".into(), database_url:"sqlite::memory:".into(),
             encryption_key:[0;32], ctu_base:"https://libapp.ctu.edu.vn/dkptl".into(),
@@ -627,6 +605,9 @@ mod tests {
         let booking_status:String=sqlx::query_scalar("SELECT status FROM bookings WHERE slot=2")
             .fetch_one(&db).await.unwrap();
         assert_eq!(booking_status,"uncertain");
+        let cancel_state: String = sqlx::query_scalar("SELECT cancellation_status FROM bookings WHERE slot=5")
+            .fetch_one(&db).await.unwrap();
+        assert_eq!(cancel_state, "uncertain");
         // Idempotent subsequent startup: no further recovery or CTU submission.
         recover_processing(&state).await.unwrap();
         let count:i64=sqlx::query_scalar("SELECT SUM(recovery_count) FROM scheduled_jobs")
@@ -654,19 +635,10 @@ mod tests {
     }
 
     #[test]
-    fn prebooking_thirteen_days_earlier_across_month() {
+    fn advance_window_starts_thirteen_days_prior() {
         let day = NaiveDate::from_ymd_opt(2026, 12, 2).unwrap();
-        let at = prebook_open_timestamp(day, "16:20").unwrap();
+        let at = window::starts_at(day).unwrap();
         let utc = DateTime::<Utc>::from_timestamp(at, 0).unwrap();
-        assert_eq!(utc.format("%Y-%m-%d %H:%M").to_string(), "2026-11-19 09:20");
-    }
-
-    #[test]
-    fn prebooking_across_new_year_and_invalid_time() {
-        let day = NaiveDate::from_ymd_opt(2027, 1, 5).unwrap();
-        let at = prebook_open_timestamp(day, "00:00").unwrap();
-        let utc = DateTime::<Utc>::from_timestamp(at, 0).unwrap();
-        assert_eq!(utc.format("%Y-%m-%d %H:%M").to_string(), "2026-12-22 17:00");
-        assert!(prebook_open_timestamp(day, "25:00").is_err());
+        assert_eq!(utc.format("%Y-%m-%d %H:%M").to_string(), "2026-11-18 17:00");
     }
 }
