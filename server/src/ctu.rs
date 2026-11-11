@@ -105,9 +105,10 @@ pub async fn book(
         },
     }
     // The public schedule is fetched without a CTU session. Recheck using the
-    // SAME authenticated cookie jar that will submit the booking. Do not infer
-    // that `catrong_khl` means reserved: it means empty but not clickable in
-    // that view. The CTU booking endpoint makes the final eligibility decision.
+    // SAME authenticated cookie jar that will submit the booking. `catrong_khl`
+    // means empty but NOT clickable. Immediate bookings preserve the original
+    // attempt-and-confirm behavior; scheduled jobs require an explicitly open
+    // slot because a premature POST cannot be retried safely.
     let authed_calendar = match request(state, &mut jar, "lich.php", None).await {
         Ok((200..=299, body)) => match schedule::parse(&body) {
             Ok(calendar) => calendar,
@@ -132,7 +133,10 @@ pub async fn book(
     tracing::info!(stage="authenticated_timetable", slot_status=?source_slot.map(|s| s.status.as_str()),
         "CTU authenticated timetable occupancy check");
     match source_slot.map(|s| s.status.as_str()) {
-        Some("available") | Some("vacant") => {},
+        Some("available") => {},
+        Some("vacant") if job_id.is_none() => {},
+        Some("vacant") => return Outcome::Failed(
+            "The authenticated CTU shift is no longer bookable; no booking POST sent".into()),
         Some("reserved") => return Outcome::Failed("CTU reports this shift as already reserved".into()),
         Some("closed") | Some("unavailable") => return Outcome::Failed("CTU reports this shift as closed or expired".into()),
         _ => return Outcome::Failed("The shift is missing from the logged-in CTU timetable".into()),
@@ -168,6 +172,59 @@ pub async fn book(
             Outcome::Uncertain("The CTU response was lost after submission; verify before retrying".into())
         },
     }
+}
+
+/// A read-only booking eligibility check for **advance jobs**. The only POST
+/// here is authentication (`dangnhap.php`); this never calls `dangky.php`.
+/// An anonymous `vacant` cell is not evidence that booking has opened.
+/// Treat ambiguous CTU replies as "waiting", not as permission to submit.
+#[derive(Debug)]
+pub enum PreflightOutcome {
+    Ready,
+    Waiting(String),
+    Blocked(String),
+}
+
+fn interpret_authenticated_status(status: Option<&str>) -> PreflightOutcome {
+    match status {
+        Some("available") => PreflightOutcome::Ready,
+        Some("reserved") | Some("closed") => PreflightOutcome::Blocked(
+            "CTU reports this shift as reserved or closed".into()),
+        // `catrong_khl` is vacant but not bookable in this authenticated view.
+        // Do not consume the only POST attempt before CTU visibly opens it.
+        _ => PreflightOutcome::Waiting("CTU has not exposed a bookable shift for this account".into()),
+    }
+}
+
+pub async fn preflight_authenticated(
+    state: &AppState, username: &str, password: &str,
+    room_id: i64, shift: i64, date: &str,
+) -> PreflightOutcome {
+    let mut jar = CookieJar::default();
+    match request(state, &mut jar, "", None).await {
+        Ok((200..=299, _)) => {},
+        _ => return PreflightOutcome::Waiting("CTU login session is temporarily unavailable".into()),
+    }
+    match request(state, &mut jar, "dangnhap.php", Some(&[
+        ("txtusername", username), ("txtpassword", password),
+    ])).await {
+        Ok((200..=299, body)) if notice(&body, "Xin chào :)") => {},
+        Ok((200..=299, _)) => return PreflightOutcome::Blocked("CTU login not confirmed; check CTU credentials".into()),
+        _ => return PreflightOutcome::Waiting("CTU login service unavailable".into()),
+    }
+    let calendar = match request(state, &mut jar, "lich.php", None).await {
+        Ok((200..=299, body)) => match schedule::parse(&body) {
+            Ok(calendar) => calendar,
+            Err(_) => return PreflightOutcome::Waiting("Cannot parse the authenticated CTU timetable".into()),
+        },
+        _ => return PreflightOutcome::Waiting("Cannot read the authenticated CTU timetable".into()),
+    };
+    let status = calendar.slots.iter().find(|s|
+        s.room_id == room_id && s.slot == shift && s.date == date
+    ).map(|s| s.status.as_str());
+    tracing::info!(stage="advance_authenticated_preflight", room_id, shift, booking_date=date,
+        slot_status=?status, "Read-only check before an advance booking POST");
+    interpret_authenticated_status(status)
 }
 
 /// Cancellation is a distinct one-shot CTU operation. The form uses multipart
@@ -299,6 +356,86 @@ mod tests {
             assert!(body.contains(&format!("\r\n\r\n{value}\r\n")));
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn advance_preflight_does_not_submit_booking_for_authenticated_vacancy() {
+        use crate::{config::Config, state::AppState};
+        use axum::{routing::{get, post}, Router};
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::{sync::{Arc, atomic::{AtomicI64, AtomicUsize, Ordering}}, time::Duration};
+        use tokio::sync::Mutex;
+        let submits = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&submits);
+        let page = include_str!("../../fixtures/lich-2026-11-05.html").to_string();
+        let router = Router::new()
+            .route("/dkptl/", get(|| async {
+                ([(axum::http::header::SET_COOKIE, "PHPSESSID=test; Path=/")], "ready")
+            }))
+            .route("/dkptl/dangnhap.php", post(|| async {
+                "<div class='tb_ok'>Xin chào :)</div>"
+            }))
+            .route("/dkptl/lich.php", get(move || {
+                let html = page.clone();
+                async move { html }
+            }))
+            .route("/dkptl/dangky.php", post(move || {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    "unexpected booking submission"
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let db = SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        let cfg = Config {
+            bind:"127.0.0.1:0".into(), database_url:"sqlite::memory:".into(),
+            encryption_key:[0;32], ctu_base:format!("http://{address}/dkptl"),
+            allowed_origins:vec![], cookie_secure:false, telegram_token:None,
+            telegram_username:None, refresh_secs:120, seed_fixture:false,
+        };
+        let state = AppState {
+            db, http:reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap(),
+            cfg:Arc::new(cfg), booking_gate:Arc::new(Mutex::new(())),
+            sync_gate:Arc::new(Mutex::new(())),
+            scheduler_heartbeat:Arc::new(AtomicI64::new(0)),
+            scheduler_last_db_ok:Arc::new(AtomicI64::new(0)),
+            scheduler_notify:Arc::new(tokio::sync::Notify::new()),
+        };
+        let outcome = super::preflight_authenticated(
+            &state, "student", "password", 1, 1, "2026-11-13").await;
+        assert!(matches!(outcome, super::PreflightOutcome::Waiting(_)));
+        assert_eq!(submits.load(Ordering::Relaxed), 0);
+        server.abort();
+    }
+
+    #[test]
+    fn authenticated_status_is_exhaustive_and_fail_closed() {
+        assert!(matches!(super::interpret_authenticated_status(Some("available")),
+            super::PreflightOutcome::Ready));
+        assert!(matches!(super::interpret_authenticated_status(Some("vacant")),
+            super::PreflightOutcome::Waiting(_)));
+        assert!(matches!(super::interpret_authenticated_status(Some("unexpected_status")),
+            super::PreflightOutcome::Waiting(_)));
+        assert!(matches!(super::interpret_authenticated_status(None),
+            super::PreflightOutcome::Waiting(_)));
+        assert!(matches!(super::interpret_authenticated_status(Some("reserved")),
+            super::PreflightOutcome::Blocked(_)));
+        assert!(matches!(super::interpret_authenticated_status(Some("closed")),
+            super::PreflightOutcome::Blocked(_)));
+    }
+
+    #[test]
+    fn anonymous_empty_slot_does_not_imply_authorized_open_slot() {
+        let calendar = crate::schedule::parse(include_str!("../../fixtures/lich-2026-11-05.html")).unwrap();
+        let cell = calendar.slots.iter().find(|s|
+            s.room_id == 1 && s.date == "2026-11-13" && s.slot == 1).unwrap();
+        assert_eq!(cell.status, "vacant");
+        // The advance authenticated preflight permits only explicit "available".
+        assert_ne!(cell.status, "available");
     }
 
     #[test]

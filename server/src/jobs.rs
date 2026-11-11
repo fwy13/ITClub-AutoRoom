@@ -1,8 +1,8 @@
-use crate::{api::{self, BookRequest}, auth, error::ApiError, schedule, state::AppState, telegram, window};
+use crate::{api::{self, BookRequest}, auth, crypto, ctu, error::ApiError, schedule, state::AppState, telegram, window};
 use axum::{extract::{Path, State}, http::{HeaderMap, StatusCode}, Json};
 use std::sync::atomic::Ordering;
 use tokio::task::JoinSet;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -104,6 +104,14 @@ pub async fn create(
         "SELECT count(*) FROM bookings WHERE room_id=? AND booking_date=? AND slot=? AND status IN ('pending','confirmed','uncertain') AND cancellation_status <> 'cancelled'"
     ).bind(r.room_id).bind(&r.date).bind(r.slot).fetch_one(&state.db).await?;
     if active > 0 { return Err(ApiError::conflict("This room/shift is already booked or awaiting confirmation")); }
+    // Match the same-user overlap rule enforced for immediate bookings. Without
+    // this check we accept an advance job that can never pass submission checks.
+    let user_active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM bookings WHERE user_id=? AND booking_date=? AND status IN ('pending','confirmed','uncertain') AND cancellation_status <> 'cancelled' AND (slot=? OR slot>=7 OR ?>=7)"
+    ).bind(user.id).bind(&r.date).bind(r.slot).bind(r.slot).fetch_one(&state.db).await?;
+    if user_active > 0 {
+        return Err(ApiError::conflict("You already have an overlapping active or unverified reservation"));
+    }
 
     // Single-instance booking_gate serializes advance creation and direct booking.
     // A booking held by another user's queue must not be double-scheduled.
@@ -129,7 +137,6 @@ pub async fn create(
         }
         Err(e) => return Err(e.into()),
     };
-    
     tracing::info!(stage="job_created", job_id=id, user_id=user.id, kind,
         room_id=r.room_id, booking_date=%r.date, shift=r.slot, run_at,
         "Scheduled booking saved to SQLite");
@@ -268,13 +275,18 @@ async fn reconcile_linked_booking(
 
 // A temporary preflight failure can be rechecked during the opening window.
 // Never requeue once a booking row exists or submission_started was recorded.
+fn next_retry_at(now: i64, deadline: i64) -> Option<i64> {
+    // Never schedule after the window; still allow one final check at its end.
+    (now < deadline).then_some(now.saturating_add(RETRY_INTERVAL_SECONDS).min(deadline))
+}
+
 async fn postpone(state: &AppState, id: i64, deadline: i64, reason: &str) -> Result<bool, ApiError> {
     let now = Utc::now().timestamp();
-    if now + RETRY_INTERVAL_SECONDS <= deadline {
+    if let Some(next) = next_retry_at(now, deadline) {
         let result = sqlx::query("UPDATE scheduled_jobs SET status='scheduled',execution_phase='preflight',run_at=?,message=? WHERE id=? AND status='processing' AND execution_phase='preflight' AND booking_id IS NULL")
-            .bind(now + RETRY_INTERVAL_SECONDS).bind(reason).bind(id).execute(&state.db).await?;
+            .bind(next).bind(reason).bind(id).execute(&state.db).await?;
         if result.rows_affected() == 1 {
-            tracing::info!(stage="preflight_retry", job_id=id, next_run_at=now + RETRY_INTERVAL_SECONDS,
+            tracing::info!(stage="preflight_retry", job_id=id, next_run_at=next,
                 retry_deadline=deadline, reason, "CTU slot not ready; retry scheduled without POST");
             state.scheduler_notify.notify_one();
             return Ok(true);
@@ -318,7 +330,9 @@ async fn process_claimed(state: AppState, job: DueJob) {
                         finish_failure(&state,id,user_id,"CTU reports this shift as reserved or closed").await;
                         return;
                     }
-                    Some("unavailable") | None => {
+                    // `&str` is an open type: do not enumerate Some(_) variants.
+                    // Unknown, expired or missing cells are NOT permission to POST.
+                    _ => {
                         let reason = "Waiting for CTU to open this slot (no booking POST sent)";
                         if let Some(until) = job.retry_until {
                             if matches!(postpone(&state,id,until,reason).await,Ok(true)) {return;}
@@ -335,6 +349,44 @@ async fn process_claimed(state: AppState, job: DueJob) {
                     if matches!(postpone(&state,id,until,"Schedule unavailable; no POST sent").await,Ok(true)) {return;}
                 }
                 finish_failure(&state,id,user_id,"CTU schedule was unavailable during the checking window").await;
+                return;
+            }
+        }
+    }
+
+    // The anonymous calendar can say `vacant` even when CTU is NOT accepting
+    // reservations yet. Check the authenticated calendar BEFORE inserting a
+    // local booking or setting submission_started. Only a visibly open slot
+    // may cause the one-shot CTU booking POST.
+    if job.kind == "prebook" {
+        let user = match auth::user_by_id(&state,user_id).await {
+            Ok(user) => user,
+            Err(error) => {
+                finish_failure(&state,id,user_id,&error.1).await;
+                return;
+            }
+        };
+        let password = match crypto::decrypt(&state.cfg.encryption_key, &user.ctu_password_ciphertext) {
+            Ok(password) => password,
+            Err(_) => {
+                finish_failure(&state,id,user_id,"Cannot decrypt CTU credentials; no booking POST sent").await;
+                return;
+            }
+        };
+        match ctu::preflight_authenticated(&state, &user.ctu_username, &password,
+            req.room_id, req.slot, &req.date).await {
+            ctu::PreflightOutcome::Ready => {},
+            ctu::PreflightOutcome::Blocked(reason) => {
+                finish_failure(&state,id,user_id,&reason).await;
+                return;
+            }
+            ctu::PreflightOutcome::Waiting(reason) => {
+                if let Some(until) = job.retry_until {
+                    if matches!(postpone(&state,id,until,&reason).await,Ok(true)) {return;}
+                }
+                finish_failure(&state,id,user_id,&format!(
+                    "CTU booking window elapsed without an authenticated open slot: {reason}"
+                )).await;
                 return;
             }
         }
@@ -556,6 +608,7 @@ pub async fn loop_jobs(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::DateTime;
 
     #[tokio::test]
     async fn interrupted_jobs_are_recovered_without_replaying_possible_ctu_posts() {
@@ -633,6 +686,68 @@ mod tests {
         signal.notify_one();
         tokio::time::timeout(TokioDuration::from_millis(250), wait)
             .await.expect("change notification must wake scheduler");
+    }
+
+    #[test]
+    fn retry_deadline_is_inclusive_and_does_not_overflow() {
+        assert_eq!(next_retry_at(100, 100), None);
+        assert_eq!(next_retry_at(100, 101), Some(101));
+        assert_eq!(next_retry_at(100, 500), Some(400));
+        assert_eq!(next_retry_at(i64::MAX - 2, i64::MAX), Some(i64::MAX));
+    }
+
+    #[tokio::test]
+    async fn existing_user_booking_prevents_advance_overlap() {
+        use crate::{config::Config, state::AppState};
+        use sqlx::sqlite::SqlitePoolOptions;
+        use std::{sync::{Arc, atomic::AtomicI64}, time::Duration};
+        use tokio::sync::Mutex;
+        let db = SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db).await.unwrap();
+        sqlx::query("INSERT INTO users(id,username,password_hash,ctu_username,ctu_password_ciphertext) VALUES(1,'test','hash','ctu','cipher')")
+            .execute(&db).await.unwrap();
+        sqlx::query("INSERT INTO rooms(id,name,floor) VALUES(1,'Room A','2'),(2,'Room B','2')")
+            .execute(&db).await.unwrap();
+        let now = Utc::now().timestamp();
+        let cfg = Config {
+            bind:"127.0.0.1:0".into(), database_url:"sqlite::memory:".into(),
+            encryption_key:[0;32], ctu_base:"http://127.0.0.1:1/dkptl".into(),
+            allowed_origins:vec![],cookie_secure:false,telegram_token:None,telegram_username:None,
+            refresh_secs:120,seed_fixture:false,
+        };
+        let state = AppState {
+            db:db.clone(),http:reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap(),
+            cfg:Arc::new(cfg),booking_gate:Arc::new(Mutex::new(())),sync_gate:Arc::new(Mutex::new(())),
+            scheduler_heartbeat:Arc::new(AtomicI64::new(now)),scheduler_last_db_ok:Arc::new(AtomicI64::new(now)),
+            scheduler_notify:Arc::new(tokio::sync::Notify::new()),
+        };
+        let target = window::today_vn(Utc::now()) + chrono::Duration::days(14);
+        let target_str = target.format("%Y-%m-%d").to_string();
+        sqlx::query("INSERT INTO bookings(user_id,room_id,booking_date,slot,students,note,status) VALUES(1,2,?,1,5,'Existing','confirmed')")
+            .bind(&target_str).execute(&db).await.unwrap();
+        let token = "a".repeat(64);
+        sqlx::query("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES(?,1,?)")
+            .bind(crate::crypto::digest(&token)).bind(now+300).execute(&db).await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::COOKIE, format!("ctu_session={token}").parse().unwrap());
+        let new_job = || NewJob {
+            request: BookRequest {
+                room_id:1, date:target_str.clone(), slot:1,
+                students:5, note:"Test".into(), borrow_tv:false,
+            },
+            kind:Some("prebook".into()), run_at:None, open_time_vn:None,
+        };
+        // The other reservation is in Room B; only the user-overlap rule rejects it.
+        let error = create(State(state.clone()), headers.clone(), Json(new_job()))
+            .await.err().expect("overlapping active reservation must be rejected");
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("overlapping active"));
+        // An explicitly cancelled CTU booking must no longer block a new attempt.
+        sqlx::query("UPDATE bookings SET cancellation_status='cancelled' WHERE user_id=1")
+            .execute(&db).await.unwrap();
+        let (_status, body) = create(State(state), headers, Json(new_job())).await.unwrap();
+        assert_eq!(body.0["status"], "scheduled");
     }
 
     #[test]

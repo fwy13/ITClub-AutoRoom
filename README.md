@@ -129,3 +129,20 @@ sudo docker compose logs -f --tail=200 --timestamps app
 ```
 
 Follow `job_id` and `stage` to see `claimed` → `preflight` → `public_timetable` → `login` → `authenticated_timetable` → `submission` → `completed`. Each check logs the room ID, target date, shift and occupancy status where relevant; HTTP requests include status and elapsed milliseconds at DEBUG level. Only a confirmed CTU success notice reports booking success. Jobs already marked `failed` are **not** automatically replayed by logging changes; check the official CTU site before creating another attempt. Never share `.env`, Telegram tokens, session cookies, or unredacted private logs.
+
+### Advance-job safety (scheduler review)
+
+Advance jobs check the anonymous timetable and then sign into CTU to read the
+authenticated timetable **before** attempting a reservation. An empty, non-clickable
+`catrong_khl` slot is treated as *not yet open* for an advance job: the scheduler
+rechecks it at most every five minutes during the first eligible day. Only an
+explicitly available authenticated slot authorizes the one-time booking attempt.
+This is conservative: if CTU never exposes an explicitly open cell, the job will
+fail with a diagnostic instead of sending an early/ambiguous booking POST.
+Immediate/manual bookings retain the original CTU confirmation behavior.
+No automatic retry occurs after a possible `dangky.php` POST.
+
+When applying this patch, use the checkout matching the supplied `jobs.rs` and
+other v4 project files. Run `git apply --check`
+before `git apply`, then `cargo test` and a clean Docker build. Keep the existing
+SQLite volume and encryption key.
