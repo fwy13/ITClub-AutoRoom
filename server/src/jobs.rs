@@ -12,7 +12,7 @@ use tokio::time::{Duration as TokioDuration, Instant, MissedTickBehavior};
 // not documented in the supplied source. Avoid assuming that midnight is open.
 // Only pre-submission checks may retry. After a possible POST, never retry.
 const RETRY_WINDOW_SECONDS: i64 = 24 * 3600 - 60;
-const RETRY_INTERVAL_SECONDS: i64 = 5 * 60;
+const DEFAULT_RETRY_INTERVAL_MINUTES: i64 = 5;
 // The normal scheduler sleeps until the next due job. This is only a recovery/health backstop.
 const WATCHDOG_SCAN_SECONDS: u64 = 30;
 const ERROR_BACKOFF_SECONDS: u64 = 5;
@@ -28,6 +28,8 @@ pub struct NewJob {
     run_at: Option<String>,
     #[serde(default)]
     open_time_vn: Option<String>,
+    #[serde(default)]
+    retry_interval_minutes: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -44,6 +46,7 @@ pub struct Job {
     kind: String,
     opens_at: Option<i64>,
     retry_until: Option<i64>,
+    retry_interval_minutes: i64,
     attempts: i64,
     recovery_count: i64,
     recovered_at: Option<i64>,
@@ -77,17 +80,31 @@ pub async fn create(
     let now = Utc::now();
     let today = window::today_vn(now);
     if window::classify(date, today) != window::Window::Advance {
-        return Err(ApiError::bad("Advance booking dates must be from A+14 through A+44 (Vietnam time)"));
+        return Err(ApiError::bad("Choose a date between 14 and 44 days from today (Vietnam time)"));
     }
     if p.kind.as_deref().unwrap_or("prebook") != "prebook" {
         return Err(ApiError::bad("Use /api/bookings for immediate reservations; only prebook jobs can be created"));
     }
-    if p.run_at.is_some() || p.open_time_vn.is_some() {
-        return Err(ApiError::bad("Advance bookings are automatic; do not supply run_at or open_time_vn"));
+    if p.run_at.is_some() {
+        return Err(ApiError::bad("Do not supply an absolute run_at; choose a Vietnam-local check time"));
     }
-    let run_at = window::starts_at(date).ok_or_else(|| ApiError::bad("Invalid target date"))?;
+    let check_time = p.open_time_vn.as_deref().unwrap_or("00:00");
+    let (hour, minute) = check_time.split_once(':')
+        .ok_or_else(|| ApiError::bad("Check time must be HH:MM"))?;
+    let hour: u32 = hour.parse().map_err(|_| ApiError::bad("Invalid checking hour"))?;
+    let minute: u32 = minute.parse().map_err(|_| ApiError::bad("Invalid checking minute"))?;
+    if hour > 23 || minute > 59 || check_time.len() != 5 {
+        return Err(ApiError::bad("Check time must be HH:MM (00:00-23:59)"));
+    }
+    let retry_interval_minutes = p.retry_interval_minutes.unwrap_or(DEFAULT_RETRY_INTERVAL_MINUTES);
+    if ![5, 15, 30, 60, 120, 180, 360].contains(&retry_interval_minutes) {
+        return Err(ApiError::bad("Retry interval must be 5, 15, 30, 60, 120, 180 or 360 minutes"));
+    }
+    let opening_midnight = window::starts_at(date).ok_or_else(|| ApiError::bad("Invalid target date"))?;
+    let run_at = opening_midnight + i64::from(hour) * 3600 + i64::from(minute) * 60;
     let opens_at = Some(run_at);
-    let retry_until = Some(run_at + RETRY_WINDOW_SECONDS);
+    // End at 23:59 on the 13-day opening date, not 24h after a late start.
+    let retry_until = Some(opening_midnight + RETRY_WINDOW_SECONDS);
     let kind = "prebook";
 
     let target_end = date.and_hms_opt(23, 59, 59).expect("valid date").and_utc().timestamp() - 7 * 3600;
@@ -124,11 +141,11 @@ pub async fn create(
     ).bind(user.id).bind(&r.date).bind(r.slot).bind(r.slot).fetch_one(&state.db).await?;
     if overlapping_job > 0 { return Err(ApiError::conflict("You already have an overlapping advance booking")); }
     let inserted = sqlx::query(
-        "INSERT INTO scheduled_jobs(user_id,room_id,booking_date,slot,students,note,borrow_tv,run_at,kind,opens_at,retry_until) VALUES(?,?,?,?,?,?,?,?,?,?,?)"
+        "INSERT INTO scheduled_jobs(user_id,room_id,booking_date,slot,students,note,borrow_tv,run_at,kind,opens_at,retry_until,retry_interval_minutes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
     )
         .bind(user.id).bind(r.room_id).bind(&r.date).bind(r.slot)
         .bind(r.students).bind("").bind(r.borrow_tv)
-        .bind(run_at).bind(kind).bind(opens_at).bind(retry_until)
+        .bind(run_at).bind(kind).bind(opens_at).bind(retry_until).bind(retry_interval_minutes)
         .execute(&state.db).await;
     let id = match inserted {
         Ok(row) => row.last_insert_rowid(),
@@ -145,7 +162,7 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(json!({
         "id": id, "status": "scheduled", "kind": kind,
         "run_at": run_at, "opens_at": opens_at,
-        "retry_until": retry_until,
+        "retry_until": retry_until, "retry_interval_minutes": retry_interval_minutes,
     }))))
 }
 
@@ -158,7 +175,7 @@ pub async fn list(State(state): State<AppState>, headers: HeaderMap) -> Result<J
         date: r.get("booking_date"), slot: r.get("slot"), students: r.get("students"),
         note: r.get("note"), borrow_tv: r.get::<i64,_>("borrow_tv") != 0,
         run_at: r.get("run_at"), kind: r.get("kind"), opens_at: r.get("opens_at"),
-        retry_until: r.get("retry_until"), attempts: r.get("attempts"),
+        retry_until: r.get("retry_until"), retry_interval_minutes: r.get("retry_interval_minutes"), attempts: r.get("attempts"),
         recovery_count: r.get("recovery_count"), recovered_at: r.get("recovered_at"),
         execution_phase: r.get("execution_phase"),
         status: r.get("status"), message: r.get("message"), booking_id: r.get("booking_id"),
@@ -275,14 +292,14 @@ async fn reconcile_linked_booking(
 
 // A temporary preflight failure can be rechecked during the opening window.
 // Never requeue once a booking row exists or submission_started was recorded.
-fn next_retry_at(now: i64, deadline: i64) -> Option<i64> {
+fn next_retry_at(now: i64, deadline: i64, interval_minutes: i64) -> Option<i64> {
     // Never schedule after the window; still allow one final check at its end.
-    (now < deadline).then_some(now.saturating_add(RETRY_INTERVAL_SECONDS).min(deadline))
+    (now < deadline).then_some(now.saturating_add(interval_minutes.saturating_mul(60)).min(deadline))
 }
 
-async fn postpone(state: &AppState, id: i64, deadline: i64, reason: &str) -> Result<bool, ApiError> {
+async fn postpone(state: &AppState, id: i64, deadline: i64, interval_minutes: i64, reason: &str) -> Result<bool, ApiError> {
     let now = Utc::now().timestamp();
-    if let Some(next) = next_retry_at(now, deadline) {
+    if let Some(next) = next_retry_at(now, deadline, interval_minutes) {
         let result = sqlx::query("UPDATE scheduled_jobs SET status='scheduled',execution_phase='preflight',run_at=?,message=? WHERE id=? AND status='processing' AND execution_phase='preflight' AND booking_id IS NULL")
             .bind(next).bind(reason).bind(id).execute(&state.db).await?;
         if result.rows_affected() == 1 {
@@ -302,6 +319,7 @@ struct DueJob {
     request: BookRequest,
     kind: String,
     retry_until: Option<i64>,
+    retry_interval_minutes: i64,
 }
 
 async fn process_claimed(state: AppState, job: DueJob) {
@@ -335,7 +353,7 @@ async fn process_claimed(state: AppState, job: DueJob) {
                     _ => {
                         let reason = "Waiting for CTU to open this slot (no booking POST sent)";
                         if let Some(until) = job.retry_until {
-                            if matches!(postpone(&state,id,until,reason).await,Ok(true)) {return;}
+                            if matches!(postpone(&state,id,until,job.retry_interval_minutes,reason).await,Ok(true)) {return;}
                         }
                         finish_failure(&state,id,user_id,"CTU did not open this shift during the checking window").await;
                         return;
@@ -346,7 +364,7 @@ async fn process_claimed(state: AppState, job: DueJob) {
                 tracing::warn!(stage="preflight", job_id=id, error=%error.1,
                     "Live CTU timetable cannot be checked");
                 if let Some(until) = job.retry_until {
-                    if matches!(postpone(&state,id,until,"Schedule unavailable; no POST sent").await,Ok(true)) {return;}
+                    if matches!(postpone(&state,id,until,job.retry_interval_minutes,"Schedule unavailable; no POST sent").await,Ok(true)) {return;}
                 }
                 finish_failure(&state,id,user_id,"CTU schedule was unavailable during the checking window").await;
                 return;
@@ -382,7 +400,7 @@ async fn process_claimed(state: AppState, job: DueJob) {
             }
             ctu::PreflightOutcome::Waiting(reason) => {
                 if let Some(until) = job.retry_until {
-                    if matches!(postpone(&state,id,until,&reason).await,Ok(true)) {return;}
+                    if matches!(postpone(&state,id,until,job.retry_interval_minutes,&reason).await,Ok(true)) {return;}
                 }
                 finish_failure(&state,id,user_id,&format!(
                     "CTU booking window elapsed without an authenticated open slot: {reason}"
@@ -428,7 +446,7 @@ async fn process_claimed(state: AppState, job: DueJob) {
                     // service errors are eligible for the limited prebook retry.
                     if e.0 == StatusCode::SERVICE_UNAVAILABLE {
                         if let Some(until) = job.retry_until {
-                            if matches!(postpone(&state,id,until,"CTU temporarily unavailable; no POST sent").await,Ok(true)) {return;}
+                            if matches!(postpone(&state,id,until,job.retry_interval_minutes,"CTU temporarily unavailable; no POST sent").await,Ok(true)) {return;}
                         }
                     }
                     finish_failure(&state,id,user_id,&e.1).await;
@@ -467,7 +485,7 @@ async fn claim_due(state: &AppState, workers: &mut JoinSet<()>) -> Result<(), Ap
         state.scheduler_last_db_ok.store(Utc::now().timestamp(), Ordering::Relaxed);
         return Ok(());
     }
-    let rows = sqlx::query("SELECT id,user_id,room_id,booking_date,slot,students,note,borrow_tv,kind,retry_until,attempts,run_at FROM scheduled_jobs WHERE status='scheduled' AND run_at<=? ORDER BY run_at,id LIMIT ?")
+    let rows = sqlx::query("SELECT id,user_id,room_id,booking_date,slot,students,note,borrow_tv,kind,retry_until,retry_interval_minutes,attempts,run_at FROM scheduled_jobs WHERE status='scheduled' AND run_at<=? ORDER BY run_at,id LIMIT ?")
         .bind(Utc::now().timestamp()).bind(capacity as i64).fetch_all(&state.db).await?;
     state.scheduler_last_db_ok.store(Utc::now().timestamp(), Ordering::Relaxed);
     for row in rows {
@@ -483,7 +501,7 @@ async fn claim_due(state: &AppState, workers: &mut JoinSet<()>) -> Result<(), Ap
                 students:row.get("students"),note:row.get("note"),
                 borrow_tv:row.get::<i64,_>("borrow_tv") != 0,
             },
-            kind:row.get("kind"),retry_until:row.get("retry_until"),
+            kind:row.get("kind"),retry_until:row.get("retry_until"),retry_interval_minutes:row.get("retry_interval_minutes"),
         };
         tracing::info!(stage="claimed", job_id=id, kind=%job.kind,
             room_id=job.request.room_id, booking_date=%job.request.date,
@@ -690,10 +708,12 @@ mod tests {
 
     #[test]
     fn retry_deadline_is_inclusive_and_does_not_overflow() {
-        assert_eq!(next_retry_at(100, 100), None);
-        assert_eq!(next_retry_at(100, 101), Some(101));
-        assert_eq!(next_retry_at(100, 500), Some(400));
-        assert_eq!(next_retry_at(i64::MAX - 2, i64::MAX), Some(i64::MAX));
+        assert_eq!(next_retry_at(100, 100, 5), None);
+        assert_eq!(next_retry_at(100, 101, 5), Some(101));
+        assert_eq!(next_retry_at(100, 500, 5), Some(400));
+        assert_eq!(next_retry_at(100, 7500, 120), Some(7300));
+        assert_eq!(next_retry_at(100, 600, 60), Some(600));
+        assert_eq!(next_retry_at(i64::MAX - 2, i64::MAX, 5), Some(i64::MAX));
     }
 
     #[tokio::test]
@@ -736,7 +756,7 @@ mod tests {
                 room_id:1, date:target_str.clone(), slot:1,
                 students:5, note:"Test".into(), borrow_tv:false,
             },
-            kind:Some("prebook".into()), run_at:None, open_time_vn:None,
+            kind:Some("prebook".into()), run_at:None, open_time_vn:None, retry_interval_minutes:None,
         };
         // The other reservation is in Room B; only the user-overlap rule rejects it.
         let error = create(State(state.clone()), headers.clone(), Json(new_job()))

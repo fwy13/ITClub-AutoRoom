@@ -7,6 +7,18 @@ export type Language = 'vi' | 'en'
 // unmodified rather than being guessed at or misrepresented.
 //
 const vi: Record<string, string> = {
+  'First check': 'Kiểm tra lần đầu', 'Next check': 'Kiểm tra kế tiếp',
+  'Schedule a room more than 13 days in advance': 'Đặt phòng trước hơn 13 ngày',
+  'Choose a room date from 14 to 44 days from today. Checks can start 13 days before your selected date, at the time you set below (Vietnam time).': 'Chọn ngày sử dụng phòng cách hôm nay từ 14 đến 44 ngày. Hệ thống sẽ bắt đầu kiểm tra trước ngày sử dụng 13 ngày, vào giờ bạn chọn (giờ Việt Nam).',
+  'First automatic check (Vietnam time)': 'Giờ bắt đầu tự động kiểm tra (Việt Nam)',
+  'If the slot is not yet open, check again every': 'Nếu ca chưa mở, kiểm tra lại sau mỗi',
+  'minutes': 'phút', 'hours': 'giờ', 'Retry every': 'Chu kỳ kiểm tra lại',
+  'First CTU availability check': 'Lần kiểm tra CTU đầu tiên',
+  'CTU booking is submitted only if the selected slot is open and passes authenticated checks. Rechecks stop at 23:59 ICT that day.': 'Chỉ gửi yêu cầu đặt phòng khi CTU đã mở ca và kiểm tra bằng tài khoản thành công. Ngừng kiểm tra lại lúc 23:59 cùng ngày (giờ Việt Nam).',
+  'The server checks CTU at your chosen time, not at a guaranteed CTU opening hour. If not open, it retries using your interval. After any possible booking submission, it never submits automatically again.': 'Hệ thống kiểm tra CTU vào giờ bạn chọn, không khẳng định đó là giờ thư viện mở đăng ký. Nếu ca chưa mở, hệ thống kiểm tra lại theo chu kỳ đã đặt. Sau khi có khả năng đã gửi yêu cầu đặt phòng, hệ thống không tự gửi lần thứ hai.',
+  'Choose a target date 14–44 days ahead. Each job first checks CTU 13 days before that date at your selected time. Retry timing is configurable; only confirmed bookings are reservations.': 'Chọn ngày sử dụng phòng sau 14–44 ngày. Mỗi tác vụ bắt đầu kiểm tra trước ngày sử dụng 13 ngày vào giờ đã chọn và lặp lại theo chu kỳ đặt trước. Chỉ kết quả được CTU xác nhận mới là đặt phòng thành công.',
+  'No scheduled attempts yet. Schedule a room 14–44 days ahead.': 'Chưa có lịch đăng ký. Hãy đặt trước cho ngày cách hôm nay 14–44 ngày.',
+
   'Only available, non-expired shifts can be booked. CTU confirms the reservation.': 'Chỉ ca còn mở đăng ký và chưa quá hạn mới được đặt. CTU xác nhận kết quả đặt phòng.',
   'Library reservation portal': 'Cổng đặt phòng thư viện',
   'Advance booking · A+14 to A+44': 'Đặt trước · A+14 đến A+44',
