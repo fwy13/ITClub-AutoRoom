@@ -146,19 +146,20 @@ When applying this patch, use the checkout matching the supplied `jobs.rs` and
 other v4 project files. Run `git apply --check`
 before `git apply`, then `cargo test` and a clean Docker build. Keep the existing
 SQLite volume and encryption key.
-## Immediate booking only (November 2026 update)
 
-New scheduled/advance bookings are disabled (`POST /api/jobs` returns HTTP 410).
-Existing scheduled jobs remain visible/cancellable and the scheduler is retained
-so previously accepted requests are not silently abandoned. Review or cancel
-those outstanding jobs from the legacy Scheduled attempts tab.
+## Booking form and expiry safety (November 2026 update)
 
-The immediate booking form requires group size and optionally a TV checkbox;
-free-text purpose/message has been removed. The server ignores any legacy note
-field and sends `Mượn Tivi.` only when checked. CTU availability is checked
-again with authenticated credentials; `catrong_quahan` is never bookable,
-and `catrong_khl` is only a tentative vacancy, not approval to POST.
+Advance booking remains enabled for A+14 through A+44: the durable scheduler
+starts checking 13 days before the selected date, at 00:00 ICT. The existing
+recovery and pre-submission retry behavior is unchanged. Immediate bookings
+continue for slots currently eligible within A through A+13.
 
-Cancellation uses authenticated multipart POST to `huydk.php`, with exactly
-`id_p`, `id_c`, `ngay_hoc` (`DD-MM-YYYY`). Only the explicit CTU response
-`<div class='tb_ok'>Hủy thành công :)</div>` confirms success.
+Both forms now request only the student count and optional TV checkbox; no
+free-text purpose or message is accepted for CTU submission. The server
+ignores any legacy note from direct booking and stores an empty note for new
+advance jobs. The booking worker adds `Mượn Tivi.` only when TV is checked.
+
+CTU availability is checked with authenticated credentials before submission.
+Expired `catrong_quahan` shifts are rejected; `catrong_khl` indicates vacancy
+but not permission to book. The original cancellation via `huydk.php` remains
+unchanged (`id_p`, `id_c`, `ngay_hoc`).

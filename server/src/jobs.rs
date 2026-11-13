@@ -53,13 +53,100 @@ pub struct Job {
     booking_id: Option<i64>,
 }
 
-/// Legacy queued jobs can still be listed and cancelled, but no new jobs are accepted.
 pub async fn create(
-    State(state): State<AppState>, headers: HeaderMap, Json(_request): Json<NewJob>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(p): Json<NewJob>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     auth::check_origin(&headers, &state)?;
-    let _ = auth::authenticate(&state, &headers).await?;
-    Err(ApiError(StatusCode::GONE, "Scheduled booking has been removed; select an available shift to book immediately".into()))
+    let user = auth::authenticate(&state, &headers).await?;
+    let r = &p.request;
+    if !(5..=20).contains(&r.students) {
+        return Err(ApiError::bad("Invalid group size"));
+    }
+    let valid = match r.room_id {
+        1..=3 => (1..=6).contains(&r.slot),
+        4 => (7..=9).contains(&r.slot),
+        5..=6 => (10..=13).contains(&r.slot),
+        _ => false,
+    };
+    if !valid { return Err(ApiError::bad("Invalid room/shift combination")); }
+
+    let date = NaiveDate::parse_from_str(&r.date, "%Y-%m-%d")
+        .map_err(|_| ApiError::bad("Invalid target date"))?;
+    let now = Utc::now();
+    let today = window::today_vn(now);
+    if window::classify(date, today) != window::Window::Advance {
+        return Err(ApiError::bad("Advance booking dates must be from A+14 through A+44 (Vietnam time)"));
+    }
+    if p.kind.as_deref().unwrap_or("prebook") != "prebook" {
+        return Err(ApiError::bad("Use /api/bookings for immediate reservations; only prebook jobs can be created"));
+    }
+    if p.run_at.is_some() || p.open_time_vn.is_some() {
+        return Err(ApiError::bad("Advance bookings are automatic; do not supply run_at or open_time_vn"));
+    }
+    let run_at = window::starts_at(date).ok_or_else(|| ApiError::bad("Invalid target date"))?;
+    let opens_at = Some(run_at);
+    let retry_until = Some(run_at + RETRY_WINDOW_SECONDS);
+    let kind = "prebook";
+
+    let target_end = date.and_hms_opt(23, 59, 59).expect("valid date").and_utc().timestamp() - 7 * 3600;
+    if run_at > target_end {
+        return Err(ApiError::bad("Attempt must run no later than the requested date in Vietnam"));
+    }
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM rooms WHERE id=?")
+        .bind(r.room_id).fetch_optional(&state.db).await?;
+    if exists.is_none() { return Err(ApiError::bad("Room is not loaded yet; refresh schedule")); }
+    // A pre-booking is a future attempt, but do not allow one for a slot already
+    // held locally (including an ambiguous upstream submission).
+    let _gate = state.booking_gate.lock().await;
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM bookings WHERE room_id=? AND booking_date=? AND slot=? AND status IN ('pending','confirmed','uncertain') AND cancellation_status <> 'cancelled'"
+    ).bind(r.room_id).bind(&r.date).bind(r.slot).fetch_one(&state.db).await?;
+    if active > 0 { return Err(ApiError::conflict("This room/shift is already booked or awaiting confirmation")); }
+    // Match the same-user overlap rule enforced for immediate bookings. Without
+    // this check we accept an advance job that can never pass submission checks.
+    let user_active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM bookings WHERE user_id=? AND booking_date=? AND status IN ('pending','confirmed','uncertain') AND cancellation_status <> 'cancelled' AND (slot=? OR slot>=7 OR ?>=7)"
+    ).bind(user.id).bind(&r.date).bind(r.slot).bind(r.slot).fetch_one(&state.db).await?;
+    if user_active > 0 {
+        return Err(ApiError::conflict("You already have an overlapping active or unverified reservation"));
+    }
+
+    // Single-instance booking_gate serializes advance creation and direct booking.
+    // A booking held by another user's queue must not be double-scheduled.
+    let reserved_job: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduled_jobs WHERE room_id=? AND booking_date=? AND slot=? AND status IN ('scheduled','processing')"
+    ).bind(r.room_id).bind(&r.date).bind(r.slot).fetch_one(&state.db).await?;
+    if reserved_job > 0 { return Err(ApiError::conflict("An advance booking already holds this room/shift locally")); }
+    let overlapping_job: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduled_jobs WHERE user_id=? AND booking_date=? AND status IN ('scheduled','processing') AND (slot=? OR slot>=7 OR ?>=7)"
+    ).bind(user.id).bind(&r.date).bind(r.slot).bind(r.slot).fetch_one(&state.db).await?;
+    if overlapping_job > 0 { return Err(ApiError::conflict("You already have an overlapping advance booking")); }
+    let inserted = sqlx::query(
+        "INSERT INTO scheduled_jobs(user_id,room_id,booking_date,slot,students,note,borrow_tv,run_at,kind,opens_at,retry_until) VALUES(?,?,?,?,?,?,?,?,?,?,?)"
+    )
+        .bind(user.id).bind(r.room_id).bind(&r.date).bind(r.slot)
+        .bind(r.students).bind("").bind(r.borrow_tv)
+        .bind(run_at).bind(kind).bind(opens_at).bind(retry_until)
+        .execute(&state.db).await;
+    let id = match inserted {
+        Ok(row) => row.last_insert_rowid(),
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return Err(ApiError::conflict("You already have an active scheduled attempt for this room/date/shift"));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    tracing::info!(stage="job_created", job_id=id, user_id=user.id, kind,
+        room_id=r.room_id, booking_date=%r.date, shift=r.slot, run_at,
+        "Scheduled booking saved to SQLite");
+    // A new job may be earlier than the one the scheduler is sleeping for.
+    state.scheduler_notify.notify_one();
+    Ok((StatusCode::CREATED, Json(json!({
+        "id": id, "status": "scheduled", "kind": kind,
+        "run_at": run_at, "opens_at": opens_at,
+        "retry_until": retry_until,
+    }))))
 }
 
 pub async fn list(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Vec<Job>>, ApiError> {

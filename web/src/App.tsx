@@ -26,6 +26,9 @@ const states:Record<Status,{label:string,cls:string,dot:string}>={
   unavailable:{label:'Not open',cls:'bg-slate-50 border-slate-100 text-slate-400',dot:'bg-slate-300'},
   closed:{label:'Closed',cls:'bg-slate-100 border-slate-100 text-slate-400',dot:'bg-slate-400'}
 }
+// Calculate date arithmetic in UTC; display and scheduler timestamps use ICT (UTC+07).
+const vnDatePlusDays=(days:number)=>{const now=new Date(Date.now()+7*3600_000);return new Date(Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate()+days)).toISOString().slice(0,10)}
+const minusDays=(date:string,days:number)=>{const d=new Date(`${date}T00:00:00Z`);d.setUTCDate(d.getUTCDate()-days);return d.toISOString().slice(0,10)}
 const dateLabel=(d:string,language:Language)=>new Date(`${d}T12:00:00`).toLocaleDateString(language==='vi'?'vi-VN':'en-US',{weekday:'short',month:'short',day:'numeric'})
 const fullDate=(d:string,language:Language)=>new Date(`${d}T12:00:00`).toLocaleDateString(language==='vi'?'vi-VN':'en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'})
 const timeAgo=(t:number|null,language:Language)=>t===null?(language==='vi'?'Chưa đồng bộ':'Not synchronized'):new Date(t*1000).toLocaleString(language==='vi'?'vi-VN':'en-GB',{timeZone:'Asia/Ho_Chi_Minh',dateStyle:'medium',timeStyle:'short'})+' ICT'
@@ -113,6 +116,47 @@ function BookingModal({slot,room,onClose,onDone}:{slot:Slot,room:Room,onClose:()
   </div>
 }
 
+function PreBookModal({room,onClose,onScheduled}:{room:Room,onClose:()=>void,onScheduled:()=>void}){
+  const {t}=useI18n()
+  const shifts=room.id<=3?[1,2,3,4,5,6]:room.id===4?[7,8,9]:[10,11,12,13]
+  const [date,setDate]=useState(vnDatePlusDays(14))
+  const [slot,setSlot]=useState(shifts[0])
+  const [students,setStudents]=useState(5)
+  const [borrowTv,setBorrowTv]=useState(false)
+  const [busy,setBusy]=useState(false)
+  const [error,setError]=useState('')
+  const openingDate=date?minusDays(date,13):''
+  async function submit(e:FormEvent){
+    e.preventDefault();setError('');setBusy(true)
+    try{
+      await api('/api/jobs','POST',{
+        kind:'prebook',room_id:room.id,date,slot,students,borrow_tv:borrowTv
+      })
+      onScheduled()
+    }catch(e){setError(e instanceof Error?e.message:'Unable to schedule pre-booking')}
+    finally{setBusy(false)}
+  }
+  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm" onMouseDown={e=>{if(e.target===e.currentTarget&&!busy)onClose()}}>
+    <div className="panel relative w-full max-w-lg max-h-[90vh] overflow-y-auto p-7 sm:p-9">
+      <button onClick={onClose} className="absolute right-5 top-5 rounded-lg p-2 hover:bg-slate-100" aria-label={t('Close')}><X size={18}/></button>
+      <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-blue-50 text-blue-600"><CalendarDays size={24}/></div>
+      <h2 className="text-2xl font-bold text-slate-900">{t('Advance booking · A+14 to A+44')}</h2>
+      <p className="mt-2 text-sm leading-6 text-slate-500">{t('Choose a reservation date from A+14 through A+44. The server begins checking 13 days before that date, at midnight in Vietnam (UTC+07).')}</p>
+      <div className="mt-5 rounded-2xl bg-slate-50 p-4 text-sm font-semibold text-slate-800"><BookOpen className="mr-2 inline text-blue-600" size={17}/>{room.name}</div>
+      <form className="mt-5 space-y-4" onSubmit={submit}>
+        <label className="block"><span className="field-label">{t('Target reservation date')}</span><input className="field" required type="date" min={vnDatePlusDays(14)} max={vnDatePlusDays(44)} value={date} onChange={e=>setDate(e.target.value)}/></label>
+        <label className="block"><span className="field-label">{t('Shift')}</span><select className="field" value={slot} onChange={e=>setSlot(Number(e.target.value))}>{shifts.map(s=><option value={s} key={s}>{t('Shift')} {s}{slotTimes[s]?` · ${slotTimes[s]}`:''}</option>)}</select></label>
+        <div className="rounded-2xl border border-blue-200 bg-blue-50 px-4 py-4 text-sm"><div className="font-bold text-blue-800">{t('Automatic checks begin (Vietnam time)')}</div><div className="mt-1 text-lg font-extrabold text-blue-900">{openingDate||'—'} · 00:00 ICT</div><div className="mt-1 text-xs text-blue-700">{t('13 calendar days before')} {date||t('the target date')}</div></div>
+        <label className="block"><span className="field-label">{t('Group size (5–20)')}</span><input className="field" type="number" min={5} max={20} required value={students} onChange={e=>setStudents(Number(e.target.value))}/></label>
+        <label className="flex items-center gap-3 text-sm text-slate-700"><input type="checkbox" checked={borrowTv} onChange={e=>setBorrowTv(e.target.checked)} className="h-4 w-4 accent-blue-600"/>{t('Request a TV')}</label>
+        <Notice>{t('The advance job survives restarts. Midnight starts checking, not necessarily CTU opening. Unavailable slots are rechecked during the first day. After any possible CTU booking POST, the app never retries automatically.')}</Notice>
+        {error&&<Notice kind="error">{t(error)}</Notice>}
+        <button className="btn-primary w-full" disabled={busy}>{t(busy?'Saving…':'Schedule pre-booking')}<ArrowRight size={16}/></button>
+      </form>
+    </div>
+  </div>
+}
+
 function App(){
   const {t,language,setLanguage}=useI18n()
   const [schedule,setSchedule]=useState<Schedule|null>(null)
@@ -123,6 +167,7 @@ function App(){
   const [tab,setTab]=useState<'schedule'|'bookings'|'jobs'|'account'>('schedule')
   const [authOpen,setAuthOpen]=useState(false)
   const [bookingSlot,setBookingSlot]=useState<Slot|null>(null)
+  const [preBookOpen,setPreBookOpen]=useState(false)
   const [bookingResult,setBookingResult]=useState<Booking|null>(null)
   const [cancellingId,setCancellingId]=useState<number|null>(null)
   const [loading,setLoading]=useState(true)
@@ -193,6 +238,7 @@ function App(){
             <p className="mt-2 max-w-2xl text-sm leading-7 text-slate-500 sm:text-base">{t('Explore discussion rooms, see their availability, and request a study session with your CTU account.')}</p>
           </div>
           <div className="flex flex-wrap items-center gap-3"><span className="text-xs leading-5 text-slate-500">{t('Last synced')}<br/><strong className="font-semibold text-slate-700">{timeAgo(schedule?.synced_at??null,language)}</strong></span>
+            <button className="btn-primary" onClick={()=>user?setPreBookOpen(true):setAuthOpen(true)}><CalendarDays size={16}/> {t('Advance booking · A+14 to A+44')}</button>
             <button className="btn-ghost border border-slate-200 bg-white shadow-sm" onClick={()=>void refreshSchedule(Boolean(user))} disabled={refreshing}>{<RefreshCw size={16} className={refreshing?'animate-spin':''}/>} {t('Refresh')}</button></div>
         </div>
         <div className="mt-7 flex items-center gap-2 overflow-x-auto border-b border-slate-200">
@@ -229,8 +275,8 @@ function App(){
         {!loading&&tab==='bookings'&&<section className="panel mt-6 overflow-hidden"><div className="flex items-center justify-between border-b border-slate-100 p-6"><div><h2 className="text-xl font-bold">{t('My reservations')}</h2><p className="mt-1 text-sm text-slate-500">{t('History of CTU submissions under your account')}</p></div><button onClick={()=>void refreshBookings()} className="btn-ghost"><RefreshCw size={16}/></button></div>
           {bookings.length===0?<div className="px-6 py-20 text-center text-slate-500"><CalendarDays className="mx-auto mb-4 text-slate-300" size={36}/>{t('No reservations yet.')}</div>:<div className="divide-y divide-slate-100">{bookings.map(b=><div key={b.id} className="flex flex-col justify-between gap-3 p-5 sm:flex-row sm:items-center sm:px-6"><div><div className="font-bold">{b.room_name}</div><p className="mt-1 text-sm text-slate-500">{dateLabel(b.date,language)} · {t('Shift')} {b.slot} · {b.students} {t('students')}</p><p className="mt-1 text-xs text-slate-500">{t(b.message)}</p></div><div className="flex shrink-0 flex-wrap items-center gap-2"><span className={`self-start rounded-full px-3 py-1.5 text-xs font-bold ${b.status==='confirmed'?'bg-green-100 text-green-700':b.status==='cancelled'?'bg-slate-100 text-slate-600':b.status==='failed'?'bg-red-100 text-red-700':b.status==='uncertain'||b.status==='cancel_uncertain'?'bg-amber-100 text-amber-800':'bg-slate-100 text-slate-700'}`}>{t(b.status)}</span>{b.status==='confirmed'&&<button disabled={cancellingId!==null} onClick={()=>void cancelBooking(b)} className="btn-ghost border border-rose-200 text-rose-700" aria-label={t('Cancel CTU reservation')}>{t(cancellingId===b.id?'Cancelling…':'Cancel CTU reservation')}</button>}</div></div>)}</div>}
         </section>}
-        {!loading&&tab==='jobs'&&<section className="panel mt-6 overflow-hidden"><div className="flex items-center justify-between border-b border-slate-100 p-6"><div><h2 className="text-xl font-bold">{t('Scheduled attempts')}</h2><p className="mt-1 text-sm text-slate-500">{t('Existing scheduled attempts are shown here for review or cancellation. Creating new scheduled attempts is disabled.')}</p></div><button onClick={()=>void refreshJobs()} className="btn-ghost"><RefreshCw size={16}/></button></div>
-          {jobs.length===0?<div className="px-6 py-20 text-center text-slate-500"><Clock3 className="mx-auto mb-4 text-slate-300" size={36}/>{t('No existing scheduled attempts.')}</div>:<div className="divide-y divide-slate-100">{jobs.map(j=><div key={j.id} className="flex flex-col justify-between gap-3 p-5 sm:flex-row sm:items-center sm:px-6"><div><div className="font-bold">{j.room_name} {j.kind==='prebook'&&<span className="ml-2 rounded-md bg-blue-50 px-2 py-1 text-[10px] font-bold uppercase text-blue-700">{t('Advance job')}</span>}</div><p className="mt-1 text-sm text-slate-500">{dateLabel(j.date,language)} · {t('Shift')} {j.slot} · {j.students} {t('students')}</p><p className="mt-1 text-xs text-slate-500">{t(j.kind==='prebook'?'Checks start':'Attempt')}: {timeAgo(j.opens_at??j.run_at,language)} · {t('Attempts')}: {j.attempts} · {t('Restarts recovered')}: {j.recovery_count} · {t(j.message||'Awaiting scheduled time')}</p></div><div className="flex items-center gap-2"><span className={`rounded-full px-3 py-1.5 text-xs font-bold ${j.status==='confirmed'?'bg-emerald-100 text-emerald-700':j.status==='scheduled'?'bg-blue-100 text-blue-700':j.status==='uncertain'?'bg-amber-100 text-amber-700':'bg-slate-100 text-slate-600'}`}>{t(j.status)}</span>{j.status==='scheduled'&&<button onClick={()=>void cancelJob(j.id)} className="btn-ghost text-red-600">{t('Cancel')}</button>}</div></div>)}</div>}
+        {!loading&&tab==='jobs'&&<section className="panel mt-6 overflow-hidden"><div className="flex items-center justify-between border-b border-slate-100 p-6"><div><h2 className="text-xl font-bold">{t('Scheduled attempts')}</h2><p className="mt-1 text-sm text-slate-500">{t('Advance bookings cover A+14 to A+44. The server starts checking at 00:00 ICT on the day 13 days before the target; CTU opening may be later. Only confirmed bookings are reservations. Jobs survive restarts.')}</p></div><button onClick={()=>void refreshJobs()} className="btn-ghost"><RefreshCw size={16}/></button></div>
+          {jobs.length===0?<div className="px-6 py-20 text-center text-slate-500"><Clock3 className="mx-auto mb-4 text-slate-300" size={36}/>{t('No scheduled attempts yet. Use Advance booking for dates A+14 through A+44.')}</div>:<div className="divide-y divide-slate-100">{jobs.map(j=><div key={j.id} className="flex flex-col justify-between gap-3 p-5 sm:flex-row sm:items-center sm:px-6"><div><div className="font-bold">{j.room_name} {j.kind==='prebook'&&<span className="ml-2 rounded-md bg-blue-50 px-2 py-1 text-[10px] font-bold uppercase text-blue-700">{t('Advance job')}</span>}</div><p className="mt-1 text-sm text-slate-500">{dateLabel(j.date,language)} · {t('Shift')} {j.slot} · {j.students} {t('students')}</p><p className="mt-1 text-xs text-slate-500">{t(j.kind==='prebook'?'Checks start':'Attempt')}: {timeAgo(j.opens_at??j.run_at,language)} · {t('Attempts')}: {j.attempts} · {t('Restarts recovered')}: {j.recovery_count} · {t(j.message||'Awaiting scheduled time')}</p></div><div className="flex items-center gap-2"><span className={`rounded-full px-3 py-1.5 text-xs font-bold ${j.status==='confirmed'?'bg-emerald-100 text-emerald-700':j.status==='scheduled'?'bg-blue-100 text-blue-700':j.status==='uncertain'?'bg-amber-100 text-amber-700':'bg-slate-100 text-slate-600'}`}>{t(j.status)}</span>{j.status==='scheduled'&&<button onClick={()=>void cancelJob(j.id)} className="btn-ghost text-red-600">{t('Cancel')}</button>}</div></div>)}</div>}
         </section>}
         {!loading&&tab==='account'&&user&&<div className="mt-6 grid gap-6 lg:grid-cols-2"><div className="panel p-7"><h2 className="text-xl font-bold">{t('Account details')}</h2><div className="mt-6 space-y-5 text-sm"><div><div className="text-slate-400">{t('App username')}</div><div className="mt-1 font-semibold">{user.username}</div></div><div><div className="text-slate-400">{t('Linked CTU account')}</div><div className="mt-1 font-semibold">{user.ctu_username}</div></div><div className="flex gap-2 rounded-xl bg-blue-50 p-4 text-blue-800"><ShieldCheck size={18} className="shrink-0"/><span>{t('CTU passwords are encrypted at rest and never sent to the browser after registration.')}</span></div></div></div>
           <div className="panel p-7"><div className="flex items-center gap-3"><Bell className="text-blue-600"/><h2 className="text-xl font-bold">{t('Telegram notifications')}</h2></div><p className="mt-3 text-sm leading-6 text-slate-500">{t('Connect your Telegram chat once to receive confirmed, failed, or uncertain booking outcomes. Telegram requires starting the bot first; a phone number or @username alone cannot start a private chat.')}</p>
@@ -242,6 +288,7 @@ function App(){
       </main>
     </div>
     {authOpen&&<AuthForm onDone={u=>{setUser(u);setAuthOpen(false);void refreshBookings();void refreshJobs()}} onClose={()=>setAuthOpen(false)}/>}
+    {preBookOpen&&room&&<PreBookModal room={room} onClose={()=>setPreBookOpen(false)} onScheduled={()=>{setPreBookOpen(false);setTab('jobs');void refreshJobs()}}/>}
     {bookingSlot&&room&&<BookingModal slot={bookingSlot} room={room} onClose={()=>setBookingSlot(null)} onDone={b=>{setBookingSlot(null);setBookingResult(b);void refreshBookings();void refreshSchedule()}}/>}
     {bookingResult&&<div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4 backdrop-blur-sm"><div className="panel max-w-md p-8 text-center"><div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-blue-50 text-blue-700">{bookingResult.status==='confirmed'?<CheckCircle2 size={27}/>:<Bell size={27}/>}</div><h2 className="text-xl font-bold">{t(bookingResult.status==='confirmed'?'Reservation confirmed':bookingResult.status==='uncertain'?'Confirmation could not be verified':'Reservation not confirmed')}</h2><p className="mt-3 text-sm leading-6 text-slate-500">{t(bookingResult.message)}</p><p className="mt-3 text-xs text-slate-400">{bookingResult.room_name} · {bookingResult.date} · {t('Shift')} {bookingResult.slot}</p><button className="btn-primary mt-6 w-full" onClick={()=>{setBookingResult(null);setTab('bookings')}}>{t('View my reservations')} <ArrowRight size={16}/></button></div></div>}
   </div>
