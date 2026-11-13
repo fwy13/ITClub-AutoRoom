@@ -7,7 +7,7 @@ use sqlx::Row;
 
 #[derive(Deserialize, Clone)]
 pub struct BookRequest {
-    pub room_id:i64, pub date:String, pub slot:i64, pub students:i64, pub note:String, pub borrow_tv:bool
+    pub room_id:i64, pub date:String, pub slot:i64, pub students:i64, #[serde(default)] pub note:String, #[serde(default)] pub borrow_tv:bool
 }
 #[derive(Serialize)]
 pub struct Booking {
@@ -66,7 +66,6 @@ pub async fn submit_for_user_with_job(state:&AppState,user:auth::User,p:BookRequ
         room_id=p.room_id, booking_date=%p.date, shift=p.slot,
         "Starting booking validation");
     if !(5..=20).contains(&p.students){return Err(ApiError::bad("Group size must be 5–20"));}
-    if p.note.chars().count()>200 {return Err(ApiError::bad("Note is too long"));}
     let date=NaiveDate::parse_from_str(&p.date,"%Y-%m-%d").map_err(|_|ApiError::bad("Use YYYY-MM-DD date"))?;
     let vn_today=window::today_vn(Utc::now());
     match window::classify(date, vn_today) {
@@ -84,7 +83,8 @@ pub async fn submit_for_user_with_job(state:&AppState,user:auth::User,p:BookRequ
             return Err(ApiError::bad("This shift has already ended"));
         }
     }
-    let note=if p.borrow_tv {format!("Mượn Tivi. {}",p.note.trim())} else {p.note.trim().to_owned()};
+    // The booking form only exposes the TV checkbox. Ignore legacy notes.
+    let note=if p.borrow_tv {"Mượn Tivi.".to_owned()} else {String::new()};
     // Validate the encryption key before holding a local slot.
     let ctu_password=crypto::decrypt(&state.cfg.encryption_key,&user.ctu_password_ciphertext)
         .map_err(|e|{tracing::error!(error=%e,"cannot decrypt CTU credential");ApiError::internal()})?;

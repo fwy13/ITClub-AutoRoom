@@ -7,6 +7,9 @@ export type Language = 'vi' | 'en'
 // unmodified rather than being guessed at or misrepresented.
 //
 const vi: Record<string, string> = {
+  'Only available, non-expired shifts can be booked. CTU confirms the reservation.': 'Chỉ ca còn mở đăng ký và chưa quá hạn mới được đặt. CTU xác nhận kết quả đặt phòng.',
+  'Existing scheduled attempts are shown here for review or cancellation. Creating new scheduled attempts is disabled.': 'Các lịch hẹn cũ chỉ còn để xem hoặc hủy. Hệ thống không cho tạo lịch hẹn mới.',
+  'No existing scheduled attempts.': 'Không có lịch hẹn cũ.',
   'Library reservation portal': 'Cổng đặt phòng thư viện',
   'Advance booking · A+14 to A+44': 'Đặt trước · A+14 đến A+44',
   'Choose a reservation date from A+14 through A+44. The server begins checking 13 days before that date, at midnight in Vietnam (UTC+07).': 'Chọn ngày sử dụng phòng từ A+14 đến A+44. Hệ thống bắt đầu kiểm tra từ 00:00 (giờ Việt Nam) vào ngày trước lịch sử dụng 13 ngày.',

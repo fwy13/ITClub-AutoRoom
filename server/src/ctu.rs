@@ -106,9 +106,8 @@ pub async fn book(
     }
     // The public schedule is fetched without a CTU session. Recheck using the
     // SAME authenticated cookie jar that will submit the booking. `catrong_khl`
-    // means empty but NOT clickable. Immediate bookings preserve the original
-    // attempt-and-confirm behavior; scheduled jobs require an explicitly open
-    // slot because a premature POST cannot be retried safely.
+    // means empty but NOT clickable. Do not submit unless CTU explicitly
+    // marks the slot as bookable for the authenticated account.
     let authed_calendar = match request(state, &mut jar, "lich.php", None).await {
         Ok((200..=299, body)) => match schedule::parse(&body) {
             Ok(calendar) => calendar,
@@ -134,9 +133,8 @@ pub async fn book(
         "CTU authenticated timetable occupancy check");
     match source_slot.map(|s| s.status.as_str()) {
         Some("available") => {},
-        Some("vacant") if job_id.is_none() => {},
         Some("vacant") => return Outcome::Failed(
-            "The authenticated CTU shift is no longer bookable; no booking POST sent".into()),
+            "CTU shows an empty shift but has not opened booking for this account".into()),
         Some("reserved") => return Outcome::Failed("CTU reports this shift as already reserved".into()),
         Some("closed") | Some("unavailable") => return Outcome::Failed("CTU reports this shift as closed or expired".into()),
         _ => return Outcome::Failed("The shift is missing from the logged-in CTU timetable".into()),

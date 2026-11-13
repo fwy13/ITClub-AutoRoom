@@ -51,9 +51,9 @@ pub fn parse(html: &str) -> Result<Schedule, String> {
                 // in this view (for example, before a user logs in). That does
                 // not mean a reservation exists. Keep occupancy separate from
                 // confirmed eligibility. Never promote unknown/expired cells.
-                let status = if classes.contains(&"caban") { "reserved" }
+                let status = if classes.contains(&"catrong_quahan") { "unavailable" }
+                    else if classes.contains(&"caban") { "reserved" }
                     else if classes.contains(&"chunhat") { "closed" }
-                    else if classes.contains(&"catrong_quahan") { "unavailable" }
                     else if classes.contains(&"catrong_hl") { "available" }
                     else if classes.contains(&"catrong_khl") { "vacant" }
                     else { "unavailable" };
@@ -159,6 +159,15 @@ pub async fn maybe_seed(state: &AppState) -> Result<(), ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn expired_shift_is_never_bookable_even_when_empty() {
+        let cell_classes = ["ca", "catrong", "catrong_quahan"];
+        assert!(cell_classes.contains(&"catrong_quahan"));
+        let fixture = include_str!("../../fixtures/lich-2026-11-05.html");
+        let parsed = parse(fixture).unwrap();
+        assert!(parsed.slots.iter().any(|slot| slot.status == "unavailable"));
+        assert!(parsed.slots.iter().all(|slot| !matches!(slot.status.as_str(), "catrong_quahan")));
+    }
     #[test]
     fn parses_uploaded_snapshot_and_does_not_book_unavailable_slots() {
         let s = parse(include_str!("../../fixtures/lich-2026-11-05.html")).unwrap();

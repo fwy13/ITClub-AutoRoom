@@ -146,3 +146,19 @@ When applying this patch, use the checkout matching the supplied `jobs.rs` and
 other v4 project files. Run `git apply --check`
 before `git apply`, then `cargo test` and a clean Docker build. Keep the existing
 SQLite volume and encryption key.
+## Immediate booking only (November 2026 update)
+
+New scheduled/advance bookings are disabled (`POST /api/jobs` returns HTTP 410).
+Existing scheduled jobs remain visible/cancellable and the scheduler is retained
+so previously accepted requests are not silently abandoned. Review or cancel
+those outstanding jobs from the legacy Scheduled attempts tab.
+
+The immediate booking form requires group size and optionally a TV checkbox;
+free-text purpose/message has been removed. The server ignores any legacy note
+field and sends `Mượn Tivi.` only when checked. CTU availability is checked
+again with authenticated credentials; `catrong_quahan` is never bookable,
+and `catrong_khl` is only a tentative vacancy, not approval to POST.
+
+Cancellation uses authenticated multipart POST to `huydk.php`, with exactly
+`id_p`, `id_c`, `ngay_hoc` (`DD-MM-YYYY`). Only the explicit CTU response
+`<div class='tb_ok'>Hủy thành công :)</div>` confirms success.
